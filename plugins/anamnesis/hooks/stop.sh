@@ -25,6 +25,11 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=common.sh
 . "$HOOK_DIR/common.sh"
 
+# Headless harness opt-out (parity with the Claude Code hook): reviewer, benchmark and
+# eval runs set ANAMNESIS_CAPTURE=off so their sessions never become the owner's memories.
+if [ "${ANAMNESIS_CAPTURE:-on}" = "off" ]; then
+    exit 0
+fi
 anamnesis_check_pause
 anamnesis_load_config || exit 0
 
