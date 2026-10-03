@@ -149,7 +149,38 @@ def _post(cfg: dict, message: dict) -> dict | None:
     return None
 
 
+# ANAMNESIS_CAPTURE=off (probes, review boards, benchmarks): the session must neither read the owner's memory nor
+# reach the server, because a memory lookup carries the conversation with it. The proxy then answers the protocol
+# itself, offers no tools, and never connects (the stop hook already honors the same switch).
+OFF = os.environ.get("ANAMNESIS_CAPTURE", "").strip().lower() == "off"
+
+
+def _offline(message: dict) -> dict:
+    method = message.get("method")
+    if method == "initialize":
+        return {"jsonrpc": "2.0", "id": message["id"], "result": {
+            "protocolVersion": (message.get("params") or {}).get("protocolVersion", "2025-06-18"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "anamnesis (off for this session)", "version": "0"}}}
+    if method in ("tools/list", "prompts/list", "resources/list"):
+        return {"jsonrpc": "2.0", "id": message["id"], "result": {method.split("/")[0]: []}}
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": message["id"], "result": {}}
+    return {"jsonrpc": "2.0", "id": message.get("id"),
+            "error": {"code": -32000, "message": "Anamnesis is off for this session (ANAMNESIS_CAPTURE=off)"}}
+
+
 def main() -> int:
+    if OFF:
+        for line in sys.stdin:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in message:
+                sys.stdout.write(json.dumps(_offline(message)) + "\n")
+                sys.stdout.flush()
+        return 0
     cfg = _refresh_token(_load_config())
     for line in sys.stdin:
         line = line.strip()
