@@ -1,6 +1,6 @@
 {
   "name": "anamnesis",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Persistent encrypted memory for OpenAI Codex CLI. Three lifecycle hooks (SessionStart / UserPromptSubmit / Stop) capture every session deterministically. Encrypted at rest with per-user HKDF-derived keys, no master key (not yet end-to-end — anamnesis.smtry.ai/security says exactly who can decrypt what). Browse, search, and delete at anamnesis.smtry.ai/memory.",
   "author": {
     "name": "SMTRY",

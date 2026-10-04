@@ -1,9 +1,11 @@
 # anamnesis — persistent encrypted memory for OpenAI Codex CLI
 
-Three lifecycle hooks capture every Codex CLI session. A per-user
-HKDF-derived key encrypts content server-side — nobody at smtry.ai can
-read it without your credentials. Browse, search, and delete any memory
-at [anamnesis.smtry.ai/memory](https://anamnesis.smtry.ai/memory).
+Three lifecycle hooks capture every Codex CLI session. Content is
+encrypted at rest under a per-user key with no master key; not yet
+end-to-end, and [anamnesis.smtry.ai/security](https://anamnesis.smtry.ai/security)
+says exactly who can decrypt what. Browse, search, and delete any memory
+at [anamnesis.smtry.ai/memory](https://anamnesis.smtry.ai/memory). What
+is sent, and when, is in [PRIVACY.md](PRIVACY.md).
 
 Companion to [`anamnesis-claude-code`](https://github.com/israelashley/anamnesis-claude-code)
 and [`anamnesis-gemini-cli`](https://github.com/israelashley/anamnesis-gemini-cli).
@@ -49,56 +51,38 @@ the refresh token automatically before expiry.
 **If you've already run `anamnesis-config` from a sibling extension,
 skip this step.** All three plugins read the same config file.
 
-## Launch — just `codex` (0.2.0+)
+## Launch — just `codex`
 
-Since 0.2.0 the plugin registers a **self-authenticating stdio proxy**
+The plugin registers a **self-authenticating stdio proxy**
 (`bin/anamnesis-mcp-proxy`) as its MCP server. Codex spawns it per
-session; the proxy reads and refreshes the OAuth token from
-`~/.anamnesis/config.json` itself — the same source the capture hooks
-use — and bridges stdio JSON-RPC to the remote endpoint. No wrapper, no
-environment variable, no shell alias: launch `codex` normally and the
+session; the proxy reads `~/.anamnesis/config.json` for every request and
+refreshes the OAuth token under the same lock the capture hooks use, so
+the hooks and the proxy never invalidate each other's tokens. No wrapper,
+no environment variable, no shell alias: launch `codex` normally and the
 memory tools load in every new session.
 
-### Legacy wrapper (pre-0.2.0 installs)
-
-Older versions used a remote-URL MCP config that expected the token in
-`ANAMNESIS_ACCESS_TOKEN` at process start; the bundled
-`anamnesis-codex-launch` wrapper exported it. The wrapper still works
-and is kept for those installs:
-
-```
-~/.codex/plugins/cache/smtry/anamnesis/<version>/bin/anamnesis-codex-launch
-```
-
-The wrapper:
-1. Reads `~/.anamnesis/config.json`
-2. Refreshes the access token if it's within 60s of expiry
-3. Exports `ANAMNESIS_ACCESS_TOKEN`
-4. Execs `codex` with all forwarded args
-
-**The lifecycle hooks work either way** — they read the token directly
-from `config.json` via `common.sh`, independent of the env var. The
-wrapper exists only so model-invoked MCP tool calls (`retrieve_memories`,
-etc.) work inside Codex, not just the deterministic capture path.
+Earlier versions shipped an `anamnesis-codex-launch` wrapper that exported
+the token for a remote-URL MCP config. Nothing uses that variable any more
+and the wrapper is gone; if a shell alias or function still calls it,
+remove it and run `codex` directly.
 
 ## What the hooks do
 
 | Hook | When | What it does |
 |------|------|--------------|
-| `SessionStart` | Once per session | Issues a fresh `session_id`, drains the pending-upload queue, probes server reachability. |
-| `UserPromptSubmit` | Before every user turn | Retrieves top-5 relevant engrams + a **server-time anchor** (authoritative, from the HTTP `Date:` header), injects them as `additionalContext`. |
-| `Stop` | After every assistant turn | Captures the prompt + response via `log_session`. Server dedups by SHA-256 prefix — re-sends are idempotent. |
+| `SessionStart` | Once per session | Adopts Codex's session id. In the background, replays the pending-upload queue and probes the server. |
+| `UserPromptSubmit` | Before every user turn | Retrieves up to 5 relevant memories and injects them with a `<current-datetime>` anchor (local clock, plus server UTC from the HTTP `Date:` header) as `additionalContext`. Gives up after about 3 seconds so a slow server never holds the prompt. |
+| `Stop` | After every turn | In the background, uploads the conversation added to the session's rollout file since the last upload via `log_session`. |
 
-All three are POSIX shell scripts that use `curl` + `jq`. No Node, no
+All three are bash scripts that use `curl` + `jq`. No Node, no
 compiled binaries. `python3` is only required once, by
 `anamnesis-config`, for the PKCE loopback server during OAuth consent.
 
 ## What's missing — `SessionEnd`
 
-Codex CLI **does not expose a `SessionEnd` lifecycle event** as of
-v0.124+ (Claude Code does; Gemini does). On those clients we trigger
-`/mcp/tools/session_close` immediately when a session ends, advancing
-the server-side pipeline (episodes → echoes → engrams) for that
+This plugin registers no `SessionEnd` hook. On Claude Code and Gemini CLI
+the plugin calls `/mcp/tools/session_close` when a session ends,
+advancing the server-side pipeline (episodes → echoes → engrams) for that
 session's content.
 
 In Codex, that pipeline advance falls to the **server's nightly
@@ -107,8 +91,8 @@ processes any sessions without an explicit close). Net effect:
 your engrams from a Codex session crystallize ~once a day instead
 of immediately on session exit. Functional, just slower.
 
-If OpenAI ships a `SessionEnd` event in a future Codex release,
-this plugin gains the fourth hook in a follow-up version.
+Recent Codex releases appear to expose a `SessionEnd` event; wiring it
+up is a follow-up.
 
 ## Control surface
 
@@ -118,9 +102,11 @@ anamnesis pause            suspend capture — hooks become no-ops
 anamnesis resume           re-enable capture
 ```
 
-The `paused` sentinel file at `~/.anamnesis/paused` is the first thing
-every hook checks. Deleting the file resumes immediately. **Pausing
-also pauses the Claude Code plugin and the Gemini extension** — the
+While `~/.anamnesis/paused` exists, every hook exits without sending
+anything and the MCP proxy offers no tools. `ANAMNESIS_CAPTURE=off` (or
+`0`, `false`, `no`, any case) does the same for one process tree, which is
+how review and eval harnesses keep their sessions out of your memory.
+**Pausing also pauses the Claude Code and Gemini CLI hooks**; the
 sentinel is global to your machine.
 
 ## Configuration files
@@ -128,24 +114,27 @@ sentinel is global to your machine.
 | Path | Contents | Mode |
 |------|----------|------|
 | `~/.anamnesis/config.json` | OAuth: handle, server_url, access_token, refresh_token, expires_at, client_id. Legacy: api_key, handle, server_url. | 0600 |
-| `~/.anamnesis/current_session.json` | session_id for the live session | 0600 |
-| `~/.anamnesis/paused` | present ⇒ hooks exit 0 silently | 0600 |
-| `~/.anamnesis/pending_uploads/*.json` | queued payloads from prior failures; drained on next SessionStart | 0600 |
-| `~/.anamnesis/hook_errors.log` | structured JSONL of transient errors — for debugging only | 0644 |
+| `~/.anamnesis/current_session.json` | last session id, a fallback for hooks whose payload has none | 0600 |
+| `~/.anamnesis/paused` | present ⇒ hooks exit 0 silently, proxy offline | 0600 |
+| `~/.anamnesis/pending_uploads/*.json` | queued payloads from failed uploads; replayed in the background at the next SessionStart | 0600 |
+| `~/.anamnesis/stop_state/` | per-rollout upload progress and locks | 0600 |
+| `~/.anamnesis/auth_failed` | present while the server is rejecting your sign-in | 0600 |
+| `~/.anamnesis/hook_errors.log` | structured JSONL of errors — for debugging only | 0600 |
 
-All state is user-local and user-readable. Nothing in
-`~/.codex/config.toml` holds your api_key.
+Modes are those the hooks create files with (they run under `umask 077`);
+files left by older versions keep their mode. Nothing in
+`~/.codex/config.toml` holds your credentials.
 
 ## Failure behavior
 
-Hooks **never block Codex.** On any server error they:
-
-1. Print a one-line warning to stderr.
-2. Append a structured entry to `~/.anamnesis/hook_errors.log`.
-3. Queue the failed payload under `~/.anamnesis/pending_uploads/`.
-4. Exit `1` — non-blocking. Codex continues the session.
-
-The next `SessionStart` drains the queue before doing anything else.
+Hooks **never block Codex** and always exit 0. On a server error they
+append a structured entry to `~/.anamnesis/hook_errors.log` and, for an
+upload, queue the payload under `~/.anamnesis/pending_uploads/`. The next
+`SessionStart` replays the queue in the background, stopping at the first
+failure. When the server rejects your sign-in, Codex shows one
+`[anamnesis]` warning line per session until `anamnesis-config` fixes it;
+the MCP proxy returns the same problem as the tool error and logs it to
+stderr.
 
 ## What's different from the Claude / Gemini versions
 
@@ -154,9 +143,8 @@ match Claude Code's hook names verbatim. Differences:
 
 - **No `SessionEnd`** — see above. Pipeline advance happens via the
   nightly batch instead of immediately on exit.
-- **OAuth token must be in an env var for Codex's MCP client** —
-  hence the `anamnesis-codex-launch` wrapper. The hooks read the
-  token directly from `config.json` and don't need the env var.
+- **MCP through a local proxy** — Codex talks to `bin/anamnesis-mcp-proxy`
+  over stdio, and the proxy holds the OAuth refresh logic.
 - **Token-usage telemetry disabled** — Codex emits OpenAI-shape usage
   which the current `/mcp/tools/track_usage` ingestion path doesn't
   understand. The dashboard's Tokens Paid card stays Claude-Code-only
@@ -173,9 +161,9 @@ If you also use the Claude Code plugin or Gemini extension, leave
 `~/.anamnesis/` alone — it's shared.
 
 Delete your server-side memory at `anamnesis.smtry.ai/memory` if you
-want all traces gone. Deletes are cryptographic — content is written
-to disk encrypted under your key; when you delete we also drop the key
-reference, so recovery is structurally impossible.
+want all traces gone — deletion removes the encrypted files from the
+live store, and full account deletion is self-serve from the account
+page.
 
 ## License
 
