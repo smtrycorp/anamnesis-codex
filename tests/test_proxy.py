@@ -193,15 +193,58 @@ class ProxyTest(unittest.TestCase):
         self.assertFalse(os.path.lexists(lock))
         self.assertFalse(os.path.lexists(lock + ".guard"))
 
-    def test_non_object_line_is_rejected_and_proxy_keeps_going(self):
+    def test_malformed_jsonrpc_gets_protocol_errors_and_proxy_keeps_going(self):
         proxy = self.start()
-        proxy.stdin.write("[1, 2]\n")
-        proxy.stdin.flush()
-        bad = json.loads(proxy.stdout.readline())
+        for line in ("[1, 2]", "null", "17", '{"jsonrpc": "2.0", "id": 5, "method": 3}',
+                     '{"jsonrpc": "2.0", "id": 6, "method": "initialize", "params": 1}'):
+            with self.subTest(line=line):
+                proxy.stdin.write(line + "\n")
+                proxy.stdin.flush()
+                self.assertEqual(json.loads(proxy.stdout.readline())["error"]["code"], -32600)
         good = self.call(proxy, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.finish(proxy)
-        self.assertEqual(bad["error"]["code"], -32600)
         self.assertIn("result", good)
+
+    def test_offline_responder_survives_malformed_initialize(self):
+        proxy = self.start(ANAMNESIS_CAPTURE="off")
+        bad = self.call(proxy, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": 1})
+        good = self.call(proxy, {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}})
+        self.finish(proxy)
+        self.assertEqual(bad["error"]["code"], -32600)
+        self.assertIn("off for this session", good["result"]["serverInfo"]["name"])
+
+    def test_cross_origin_redirect_is_not_followed_with_credentials(self):
+        other = os.path.join(self.tmp.name, "other")
+        os.makedirs(other)
+        server_b = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests", "mock_server.py"), other])
+        try:
+            for _ in range(50):
+                if os.path.exists(os.path.join(other, "port")):
+                    break
+                time.sleep(0.1)
+            with open(os.path.join(other, "port")) as f:
+                url_b = f"http://127.0.0.1:{f.read()}"
+            self._write(os.path.join(self.srv, "routes.json"),
+                        {"/mcp": {"status": 302, "headers": {"Location": f"{url_b}/mcp"}}})
+            proxy = self.start()
+            reply = self.call(proxy, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            self.finish(proxy)
+            self.assertIn("another origin", reply["error"]["message"])
+            self.assertFalse(os.path.exists(os.path.join(other, "requests")))
+        finally:
+            server_b.kill()
+            server_b.wait()
+
+    def test_oversized_token_response_is_an_error_not_a_crash(self):
+        self._write(os.path.join(self.srv, "routes.json"),
+                    {"/mcp": {"body": TOOLS}, "/oauth/token": {"body": {"access_token": "x" * 70000}}})
+        self.write_config(access_token="at0", refresh_token="rt0", expires_at=0)
+        proxy = self.start()
+        reply = self.call(proxy, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        again = self.call(proxy, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        self.finish(proxy)
+        self.assertIn("larger than", reply["error"]["message"])
+        self.assertIn("error", again)
 
 
 if __name__ == "__main__":

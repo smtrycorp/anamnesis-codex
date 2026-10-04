@@ -3,11 +3,11 @@
 Usage: mock_server.py <dir>. Listens on a free loopback port, writes it to
 <dir>/port and appends every request as one JSON line to <dir>/requests.
 Responses come from <dir>/routes.json, re-read per request:
-{"/path": {"status": 200, "body": {...}, "delay": 0}}; unknown paths get
-200 {"status": "ok"}; a route with "auth": "current" answers 401 unless the
-request carries the current access token. /oauth/token rotates: it accepts
-only the current refresh token (state in <dir>/oauth.json) and issues a new
-pair.
+{"/path": {"status": 200, "body": {...}, "headers": {...}, "delay": 0}};
+unknown paths get 200 {"status": "ok"}; a route with "auth": "current"
+answers 401 unless the request carries the current access token. Unless
+routes.json names it, /oauth/token rotates: it accepts only the current
+refresh token (state in <dir>/oauth.json) and issues a new pair.
 """
 
 import http.server
@@ -40,13 +40,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f.write(json.dumps({"method": self.command, "path": self.path,
                                 "auth": self.headers.get("Authorization") or self.headers.get("X-Anamnesis-Key"),
                                 "body": raw}) + "\n")
-        if path == "/oauth/token":
+        route = _routes().get(path)
+        if path == "/oauth/token" and route is None:
             return self._token(raw)
-        route = _routes().get(path, {})
+        route = route or {}
         time.sleep(route.get("delay", 0))
         if route.get("auth") == "current" and self.headers.get("Authorization") != "Bearer " + self._state()["access_token"]:
             return self._send(401, {"error": "invalid_token"})
-        self._send(route.get("status", 200), route.get("body", {"status": "ok"}))
+        self._send(route.get("status", 200), route.get("body", {"status": "ok"}), route.get("headers", {}))
 
     def _state(self):
         with open(os.path.join(DIR, "oauth.json")) as f:
@@ -65,11 +66,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         time.sleep(state.get("delay", 0))
         self._send(200, {"access_token": f"at{n}", "refresh_token": f"rt{n}", "expires_in": 3600})
 
-    def _send(self, status, body):
+    def _send(self, status, body, headers=None):
         data = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 

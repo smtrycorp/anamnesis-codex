@@ -42,6 +42,9 @@ REFRESH_MARGIN_S = 60  # same threshold as the hooks
 REFRESH_LOCK_WAIT_S = 10
 TIMEOUT_S = 20
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# A token response or an error body is a few hundred bytes; anything near
+# this is not one.
+MAX_SMALL_BODY_BYTES = 64 * 1024
 
 
 class ProxyError(Exception):
@@ -76,6 +79,30 @@ def _ssl_context() -> ssl.SSLContext:
 
 
 _SSL_CTX = _ssl_context()
+
+
+class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib re-sends the Authorization header to wherever a redirect
+    points, so only a redirect that stays on the configured origin (same
+    scheme, host and port, hence no https to http downgrade) is followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if (new.scheme, new.netloc) != (old.scheme, old.netloc):
+            raise ProxyError(
+                f"the server redirected to another origin ({new.scheme}://{new.netloc}); not followed with credentials"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_SSL_CTX), _SameOriginRedirects())
+
+
+def _read_bounded(resp, limit: int, what: str) -> bytes:
+    raw = resp.read(limit + 1)
+    if len(raw) > limit:
+        raise ProxyError(f"{what} larger than {limit} bytes")
+    return raw
 
 
 def _log(msg: str) -> None:
@@ -245,11 +272,11 @@ def _refresh(stale_access: str) -> dict:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT_S, context=_SSL_CTX) as resp:
-                tok = json.load(resp)
+            with _OPENER.open(req, timeout=TIMEOUT_S) as resp:
+                tok = json.loads(_read_bounded(resp, MAX_SMALL_BODY_BYTES, "token response"))
         except urllib.error.HTTPError as exc:
             try:
-                err = json.load(exc)
+                err = json.loads(exc.read(MAX_SMALL_BODY_BYTES))
                 detail = ": ".join(str(err[k]) for k in ("error", "error_description") if err.get(k))
             except (ValueError, AttributeError):
                 detail = ""
@@ -258,7 +285,7 @@ def _refresh(stale_access: str) -> dict:
             ) from exc
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise ProxyError(f"token refresh failed ({exc})") from exc
-        if not tok.get("access_token"):
+        if not isinstance(tok, dict) or not isinstance(tok.get("access_token"), str) or not tok["access_token"]:
             raise ProxyError("token refresh returned no access_token; run anamnesis-config")
         cfg["access_token"] = tok["access_token"]
         # A response without refresh_token keeps the current one (RFC 6749 §6).
@@ -286,13 +313,10 @@ def _send(cfg: dict, message: dict) -> tuple[int, bytes]:
         headers={"Content-Type": "application/json", **auth},
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S, context=_SSL_CTX) as resp:
-            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+        with _OPENER.open(req, timeout=TIMEOUT_S) as resp:
+            return 200, _read_bounded(resp, MAX_RESPONSE_BYTES, "server response")
     except urllib.error.HTTPError as exc:
         return exc.code, b""
-    if len(raw) > MAX_RESPONSE_BYTES:
-        raise ProxyError("server response larger than 16 MB")
-    return 200, raw
 
 
 def forward(message: dict) -> dict | None:
@@ -313,11 +337,30 @@ def forward(message: dict) -> dict | None:
     return json.loads(raw) if raw.strip() else None
 
 
+def invalid_request(message) -> dict | None:
+    """The -32600 reply for a line that is not a JSON-RPC request object, or
+    None when the shape is fine. The id goes back when it is usable."""
+    msg_id = message.get("id") if isinstance(message, dict) else None
+    if not isinstance(msg_id, (str, int)) or isinstance(msg_id, bool):
+        msg_id = None
+    params = message.get("params", {}) if isinstance(message, dict) else None
+    if (
+        isinstance(message, dict)
+        and isinstance(message.get("method"), str)
+        and isinstance(params, (dict, list))
+        and ("id" not in message or msg_id is not None or message["id"] is None)
+    ):
+        return None
+    return {"jsonrpc": "2.0", "id": msg_id,
+            "error": {"code": -32600, "message": "expected one JSON-RPC request object per line"}}
+
+
 def offline_reply(message: dict) -> dict:
     method = message.get("method")
+    params = message.get("params")
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": message["id"], "result": {
-            "protocolVersion": (message.get("params") or {}).get("protocolVersion", "2025-06-18"),
+            "protocolVersion": (params if isinstance(params, dict) else {}).get("protocolVersion", "2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "anamnesis (off for this session)", "version": "0"}}}
     if method in ("tools/list", "prompts/list", "resources/list"):
@@ -344,9 +387,9 @@ def main() -> int:
         except ValueError:
             _log("ignored a line that is not JSON")
             continue
-        if not isinstance(message, dict):
-            _reply({"jsonrpc": "2.0", "id": None,
-                    "error": {"code": -32600, "message": "expected one JSON-RPC object per line"}})
+        bad = invalid_request(message)
+        if bad is not None:
+            _reply(bad)
             continue
         is_notification = "id" not in message
         if not capture_enabled():
