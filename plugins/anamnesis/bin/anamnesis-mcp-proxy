@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""anamnesis-mcp-proxy — self-authenticating stdio MCP bridge.
+"""anamnesis-mcp-proxy: stdio MCP bridge for Codex.
 
-Codex spawns this per session (see .mcp.json). It bridges newline-delimited
-JSON-RPC on stdio to the remote Anamnesis MCP endpoint over HTTPS, reading
-and refreshing the OAuth token from ~/.anamnesis/config.json itself — the
-same source the capture hooks use.
+Codex spawns this per session (see .mcp.json). Each newline-delimited
+JSON-RPC message on stdin is forwarded to {server_url}/mcp with the
+credentials in ~/.anamnesis/config.json, and the reply goes to stdout.
 
-This replaces the anamnesis-codex-launch wrapper for MCP tools: the token
-is resolved at call time inside the proxy, so a plain `codex` launch gets
-the memory tools with no environment setup. The wrapper still works and is
-kept for older setups.
+The capture hooks rotate the OAuth refresh token too, and the server rejects
+a rotated-out one. So the proxy re-reads config.json for every request,
+refreshes only under the same refresh.lck lock the hooks use (a symlink
+naming the holder's PID), and re-reads config.json after taking it. A
+refresh that still fails is reported on stderr and returned as the tool
+error.
+
+Capture off (`anamnesis pause`, or ANAMNESIS_CAPTURE set to off/0/false/no,
+any case; an unrecognised value counts as off) is checked per message: the
+proxy then answers the protocol itself, lists no tools and never connects,
+because a memory lookup carries the conversation with it.
 
 Requires only the Python 3 standard library.
 """
@@ -20,23 +26,30 @@ import json
 import os
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-CONFIG_PATH = os.path.join(
-    os.environ.get("ANAMNESIS_HOME", os.path.expanduser("~/.anamnesis")),
-    "config.json",
-)
-REFRESH_MARGIN_S = 60  # refresh if this close to expiry — matches common.sh
+HOME = os.environ.get("ANAMNESIS_HOME", os.path.expanduser("~/.anamnesis"))
+CONFIG_PATH = os.path.join(HOME, "config.json")
+PAUSE_PATH = os.path.join(HOME, "paused")
+REFRESH_LOCK = os.path.join(HOME, "refresh.lck")
+DEFAULT_SERVER = "https://anamnesis.smtry.ai"
+REFRESH_MARGIN_S = 60  # same threshold as the hooks
+REFRESH_LOCK_WAIT_S = 10
 TIMEOUT_S = 20
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+class ProxyError(Exception):
+    """A failure to report to Codex as a JSON-RPC error and on stderr."""
 
 
 def _ssl_context() -> ssl.SSLContext:
     """Default context, with CA-bundle fallbacks for interpreters that load no
-    system CAs (e.g. python.org macOS builds without Install Certificates.command,
-    spawned without SSL_CERT_FILE in the environment)."""
+    system CAs (python.org macOS builds without Install Certificates.command)."""
     ctx = ssl.create_default_context()
     if ctx.cert_store_stats().get("x509_ca"):
         return ctx
@@ -44,21 +57,21 @@ def _ssl_context() -> ssl.SSLContext:
         import certifi  # type: ignore[import-not-found]
 
         return ssl.create_default_context(cafile=certifi.where())
-    except Exception:  # noqa: BLE001
+    except (ImportError, OSError, ssl.SSLError):
         pass
     for cafile in (
-        "/etc/ssl/cert.pem",  # macOS (LibreSSL system bundle)
+        "/etc/ssl/cert.pem",
         "/opt/homebrew/etc/ca-certificates/cert.pem",
         "/usr/local/etc/ca-certificates/cert.pem",
-        "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu
-        "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora/RHEL
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
     ):
         if os.path.exists(cafile):
             try:
                 return ssl.create_default_context(cafile=cafile)
-            except Exception:  # noqa: BLE001
+            except (OSError, ssl.SSLError):
                 continue
-    return ctx  # no bundle found — verification will fail loudly, not silently
+    return ctx  # no bundle found: verification fails loudly, not silently
 
 
 _SSL_CTX = _ssl_context()
@@ -68,94 +81,194 @@ def _log(msg: str) -> None:
     print(f"anamnesis-mcp-proxy: {msg}", file=sys.stderr, flush=True)
 
 
+def capture_enabled() -> bool:
+    if os.path.exists(PAUSE_PATH):
+        return False
+    value = os.environ.get("ANAMNESIS_CAPTURE", "on").strip().lower() or "on"
+    if value in ("on", "1", "true", "yes"):
+        return True
+    if value not in ("off", "0", "false", "no"):
+        _log(f"ANAMNESIS_CAPTURE={value} is not recognised; treating it as off")
+    return False
+
+
 def _load_config() -> dict:
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        _log(f"cannot read {CONFIG_PATH}: {exc}. Run anamnesis-config first.")
-        sys.exit(1)
-
-
-def _save_config(cfg: dict) -> None:
-    tmp = f"{CONFIG_PATH}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CONFIG_PATH)
-
-
-def _refresh_token(cfg: dict) -> dict:
-    """Refresh the access token if it is near expiry. Best-effort: on any
-    failure we keep the current token and let the server 401 tell the story."""
-    if not cfg.get("refresh_token"):
-        return cfg  # legacy api_key mode — nothing to refresh
-    if float(cfg.get("expires_at", 0)) > time.time() + REFRESH_MARGIN_S:
-        return cfg
-    server = cfg.get("server_url", "https://anamnesis.smtry.ai").rstrip("/")
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": cfg["refresh_token"],
-            "client_id": cfg.get("client_id", ""),
-        }
-    ).encode()
-    req = urllib.request.Request(
-        f"{server}/oauth/token",
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S, context=_SSL_CTX) as resp:
-            tok = json.load(resp)
-        if tok.get("access_token") and tok.get("refresh_token"):
-            cfg["access_token"] = tok["access_token"]
-            cfg["refresh_token"] = tok["refresh_token"]
-            cfg["expires_at"] = int(time.time()) + int(tok.get("expires_in", 0))
-            _save_config(cfg)
-    except Exception as exc:  # noqa: BLE001 — stale token 401s downstream
-        _log(f"token refresh failed ({exc}); continuing with current token")
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise ProxyError(f"cannot read {CONFIG_PATH} ({exc}); run anamnesis-config") from exc
+    if not isinstance(cfg, dict) or not (
+        (cfg.get("access_token") and cfg.get("refresh_token")) or cfg.get("api_key")
+    ):
+        raise ProxyError(f"{CONFIG_PATH} holds no credentials; run anamnesis-config")
     return cfg
 
 
-def _post(cfg: dict, message: dict) -> dict | None:
-    """Forward one JSON-RPC message; returns the response dict, or None for
-    accepted notifications. Retries once through a refresh on 401."""
-    server = cfg.get("server_url", "https://anamnesis.smtry.ai").rstrip("/")
-    for attempt in (1, 2):
-        auth = (
-            f"Bearer {cfg['access_token']}"
-            if cfg.get("access_token")
-            else None
-        )
+def _save_config(cfg: dict) -> None:
+    # mkstemp creates the file 0600, so the new token pair is never readable
+    # by anyone else, even before the rename.
+    fd, tmp = tempfile.mkstemp(dir=HOME, prefix="config.json.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError:
+        os.unlink(tmp)
+        raise
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lock(path: str, wait_s: float) -> bool:
+    """Takes the hooks' symlink lock; steals it only from a dead holder."""
+    me = str(os.getpid())
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            os.symlink(me, path)
+            return True
+        except FileExistsError:
+            pass
+        try:
+            holder = os.readlink(path)
+        except OSError:
+            holder = ""
+        if holder.isdigit() and not _pid_alive(int(holder)):
+            aside = f"{path}.stale.{me}"
+            try:
+                os.rename(path, aside)
+            except OSError:
+                continue
+            # Lost a race to a live taker: put its lock back.
+            target = os.readlink(aside)
+            if target != holder:
+                try:
+                    os.symlink(target, path)
+                except FileExistsError:
+                    pass
+            os.unlink(aside)
+            continue
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.1)
+
+
+def _unlock(path: str) -> None:
+    try:
+        if os.readlink(path) == str(os.getpid()):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fresh(cfg: dict) -> bool:
+    try:
+        return float(cfg.get("expires_at", 0)) > time.time() + REFRESH_MARGIN_S
+    except (TypeError, ValueError):
+        return False
+
+
+def _refresh(stale_access: str) -> dict:
+    """Returns a config with a usable access token in place of stale_access:
+    one another process already rotated in, or a new pair from the server."""
+    if not _lock(REFRESH_LOCK, REFRESH_LOCK_WAIT_S):
+        raise ProxyError("token refresh skipped: another process holds refresh.lck")
+    try:
+        cfg = _load_config()
+        if cfg.get("access_token") != stale_access and _fresh(cfg):
+            return cfg
+        server = cfg.get("server_url", DEFAULT_SERVER).rstrip("/")
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": cfg["refresh_token"],
+                "client_id": cfg.get("client_id", ""),
+            }
+        ).encode()
         req = urllib.request.Request(
-            f"{server}/mcp",
-            data=json.dumps(message).encode(),
-            headers={
-                "Content-Type": "application/json",
-                **({"Authorization": auth} if auth else {"X-Anamnesis-Key": cfg.get("api_key", "")}),
-            },
+            f"{server}/oauth/token",
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT_S, context=_SSL_CTX) as resp:
-                raw = resp.read()
-                return json.loads(raw) if raw.strip() else None
+                tok = json.load(resp)
         except urllib.error.HTTPError as exc:
-            if exc.code == 401 and attempt == 1 and cfg.get("refresh_token"):
-                cfg["expires_at"] = 0  # force refresh
-                cfg = _refresh_token(cfg)
-                continue
-            raise
-    return None
+            try:
+                err = json.load(exc)
+                detail = ": ".join(str(err[k]) for k in ("error", "error_description") if err.get(k))
+            except (ValueError, AttributeError):
+                detail = ""
+            raise ProxyError(
+                f"token refresh failed (HTTP {exc.code} {detail}); run anamnesis-config to sign in again"
+            ) from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise ProxyError(f"token refresh failed ({exc})") from exc
+        if not tok.get("access_token"):
+            raise ProxyError("token refresh returned no access_token; run anamnesis-config")
+        cfg["access_token"] = tok["access_token"]
+        # A response without refresh_token keeps the current one (RFC 6749 §6).
+        cfg["refresh_token"] = tok.get("refresh_token") or cfg["refresh_token"]
+        cfg["expires_at"] = int(time.time()) + int(tok.get("expires_in", 3600))
+        try:
+            _save_config(cfg)
+        except OSError as exc:
+            # The server has already retired the old refresh token.
+            raise ProxyError(f"could not save the new tokens ({exc}); run anamnesis-config") from exc
+        return cfg
+    finally:
+        _unlock(REFRESH_LOCK)
 
 
-# ANAMNESIS_CAPTURE=off (probes, review boards, benchmarks): the session must neither read the owner's memory nor
-# reach the server, because a memory lookup carries the conversation with it. The proxy then answers the protocol
-# itself, offers no tools, and never connects (the stop hook already honors the same switch).
-OFF = os.environ.get("ANAMNESIS_CAPTURE", "").strip().lower() == "off"
+def _send(cfg: dict, message: dict) -> tuple[int, bytes]:
+    server = cfg.get("server_url", DEFAULT_SERVER).rstrip("/")
+    if cfg.get("access_token") and cfg.get("refresh_token"):
+        auth = {"Authorization": f"Bearer {cfg['access_token']}"}
+    else:
+        auth = {"X-Anamnesis-Key": cfg["api_key"]}
+    req = urllib.request.Request(
+        f"{server}/mcp",
+        data=json.dumps(message).encode(),
+        headers={"Content-Type": "application/json", **auth},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S, context=_SSL_CTX) as resp:
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise ProxyError("server response larger than 16 MB")
+    return 200, raw
 
 
-def _offline(message: dict) -> dict:
+def forward(message: dict) -> dict | None:
+    """Forwards one JSON-RPC message; returns the reply, or None for an
+    accepted notification. A 401 gets one retry through a refresh."""
+    cfg = _load_config()
+    oauth = bool(cfg.get("access_token") and cfg.get("refresh_token"))
+    if oauth and not _fresh(cfg):
+        cfg = _refresh(cfg["access_token"])
+    status, raw = _send(cfg, message)
+    if status == 401 and oauth:
+        cfg = _refresh(cfg["access_token"])
+        status, raw = _send(cfg, message)
+    if status in (401, 403):
+        raise ProxyError(f"server rejected the sign-in (HTTP {status}); run anamnesis-config")
+    if status >= 300:
+        raise ProxyError(f"server answered HTTP {status}")
+    return json.loads(raw) if raw.strip() else None
+
+
+def offline_reply(message: dict) -> dict:
     method = message.get("method")
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": message["id"], "result": {
@@ -166,44 +279,43 @@ def _offline(message: dict) -> dict:
         return {"jsonrpc": "2.0", "id": message["id"], "result": {method.split("/")[0]: []}}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": message["id"], "result": {}}
-    return {"jsonrpc": "2.0", "id": message.get("id"),
-            "error": {"code": -32000, "message": "Anamnesis is off for this session (ANAMNESIS_CAPTURE=off)"}}
+    return {"jsonrpc": "2.0", "id": message.get("id"), "error": {
+        "code": -32000,
+        "message": "Anamnesis is off for this session (paused, or ANAMNESIS_CAPTURE is off)"}}
+
+
+def _reply(response: dict) -> None:
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
 
 
 def main() -> int:
-    if OFF:
-        for line in sys.stdin:
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "id" in message:
-                sys.stdout.write(json.dumps(_offline(message)) + "\n")
-                sys.stdout.flush()
-        return 0
-    cfg = _refresh_token(_load_config())
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         try:
             message = json.loads(line)
-        except json.JSONDecodeError:
+        except ValueError:
+            _log("ignored a line that is not JSON")
+            continue
+        if not isinstance(message, dict):
+            _reply({"jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32600, "message": "expected one JSON-RPC object per line"}})
             continue
         is_notification = "id" not in message
-        try:
-            response = _post(cfg, message)
-        except Exception as exc:  # noqa: BLE001 — surface as JSON-RPC error
-            if is_notification:
-                continue
-            response = {
-                "jsonrpc": "2.0",
-                "id": message.get("id"),
-                "error": {"code": -32000, "message": f"anamnesis proxy: {exc}"},
-            }
+        if not capture_enabled():
+            response = None if is_notification else offline_reply(message)
+        else:
+            try:
+                response = forward(message)
+            except (ProxyError, urllib.error.URLError, OSError, ValueError) as exc:
+                _log(str(exc))
+                response = None if is_notification else {
+                    "jsonrpc": "2.0", "id": message.get("id"),
+                    "error": {"code": -32000, "message": f"anamnesis proxy: {exc}"}}
         if response is not None and not is_notification:
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
+            _reply(response)
     return 0
 
 
