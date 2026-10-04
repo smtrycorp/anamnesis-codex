@@ -1,89 +1,56 @@
 #!/bin/bash
-# anamnesis/hooks/stop.sh — Codex CLI Stop hook.
-#
-# Fires once per turn after Codex generates its final response. Captures
-# the turn via /mcp/tools/log_session. Server chunks on 2000-char
-# boundaries and dedups by SHA-256 prefix — re-sending is idempotent.
-#
-# Stdin shape isn't crisply documented for Codex's Stop hook. The
-# agentic-loop family of CLIs (Claude Code, Gemini, Codex) tends to
-# converge on similar payloads, so we look for fields in this priority
-# order and fall through gracefully:
-#
-#   1. .prompt + .prompt_response   — Gemini-style (most likely match)
-#   2. .transcript_path             — Claude Code-style (read JSONL)
-#   3. .last_assistant_message      — Claude-style fallback
-#   4. raw stdin string             — last resort, server still dedups
-#
-# Token-usage telemetry is NOT fired here. Codex emits OpenAI-shape
-# usage which the current /mcp/tools/track_usage path doesn't yet
-# ingest. The dashboard's Tokens Paid card stays Claude-Code-only
-# until a multi-vendor ingestion variant ships.
+# Codex Stop: after every turn, upload the conversation added to the
+# session's rollout file since the last upload (log_session). A detached
+# worker does the network work, so the hook returns at once. No usage
+# telemetry: track_usage takes only Anthropic-shaped usage.
 
 set -u
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=common.sh
+# shellcheck source-path=SCRIPTDIR source=common.sh
 . "$HOOK_DIR/common.sh"
 
-# Headless harness opt-out (parity with the Claude Code hook): reviewer, benchmark and
-# eval runs set ANAMNESIS_CAPTURE=off so their sessions never become the owner's memories.
-if [ "${ANAMNESIS_CAPTURE:-on}" = "off" ]; then
-    exit 0
-fi
-anamnesis_check_pause
 anamnesis_load_config || exit 0
 
-SID="$(anamnesis_read_session_id)"
-if [ -z "$SID" ]; then
-    SID="recovered-$(date -u +"%Y%m%dT%H%M%SZ")"
-    anamnesis_write_session_id "$SID"
-fi
-
 STDIN_JSON="$(cat)"
+anamnesis_resolve_sid "$STDIN_JSON"
+if [ -z "$ANAMNESIS_SID" ]; then
+    ANAMNESIS_SID="recovered-$(date -u +"%Y%m%dT%H%M%SZ")"
+    anamnesis_write_session_id "$ANAMNESIS_SID"
+fi
+TRANSCRIPT_PATH="$(printf '%s' "$STDIN_JSON" | jq -r '.transcript_path // empty | strings' 2>/dev/null)"
 
-# Path 1: Gemini-style {prompt, prompt_response}
-PROMPT="$(printf '%s' "$STDIN_JSON" | jq -r '.prompt // empty' 2>/dev/null)"
-RESPONSE="$(printf '%s' "$STDIN_JSON" | jq -r '.prompt_response // empty' 2>/dev/null)"
-
-TRANSCRIPT=""
-if [ -n "$PROMPT" ] && [ -n "$RESPONSE" ]; then
-    TRANSCRIPT="user: $PROMPT
-assistant: $RESPONSE"
-elif [ -n "$RESPONSE" ]; then
-    TRANSCRIPT="$RESPONSE"
+if anamnesis_auth_warning_due; then
+    jq -n --arg msg "$ANAMNESIS_AUTH_WARNING" '{systemMessage: $msg}'
 fi
 
-# Path 2: Claude-style transcript_path JSONL
-if [ -z "$TRANSCRIPT" ]; then
-    TRANSCRIPT_PATH="$(printf '%s' "$STDIN_JSON" | jq -r '.transcript_path // empty' 2>/dev/null)"
-    if [ -n "$TRANSCRIPT_PATH" ] && [ -r "$TRANSCRIPT_PATH" ]; then
-        TRANSCRIPT="$(jq -r '. | (.message.content // .content // .text // "") | tostring' \
-            < "$TRANSCRIPT_PATH" 2>/dev/null)"
+anamnesis_stop_worker() {
+    local turns body
+    # Only rollouts under Codex's own sessions directory: the path comes
+    # from the hook payload and the file is uploaded.
+    case "$TRANSCRIPT_PATH" in
+        *..*) TRANSCRIPT_PATH="" ;;
+        "${CODEX_HOME:-$HOME/.codex}"/sessions/*.jsonl) ;;
+        *) TRANSCRIPT_PATH="" ;;
+    esac
+    if [ -z "$TRANSCRIPT_PATH" ] || [ ! -r "$TRANSCRIPT_PATH" ]; then
+        anamnesis_log_error "capture_skipped" "no readable Codex rollout in the Stop payload"
+        return 0
     fi
-fi
+    anamnesis_delta_begin "$TRANSCRIPT_PATH" || return 0
+    turns="$(printf '%s\n' "$ANAMNESIS_DELTA" | jq -cR "$ANAMNESIS_JQ_CODEX"' fromjson? | codex_turn' 2>/dev/null)"
+    if [ -z "$turns" ]; then
+        anamnesis_log_error "capture_skipped" "no conversation records in the new rollout lines (sid=$ANAMNESIS_SID)"
+    else
+        body="$(printf '%s\n' "$turns" | jq -sc --arg sid "$ANAMNESIS_SID" \
+            '{session_id: $sid, transcript: join("\n"), source: "codex_cli_plugin"}')"
+        if ! anamnesis_post "/mcp/tools/log_session" "$body" >/dev/null; then
+            anamnesis_queue_payload "/mcp/tools/log_session" "$body"
+            anamnesis_log_error "log_session_queued" "sid=$ANAMNESIS_SID"
+        fi
+    fi
+    anamnesis_delta_commit
+}
 
-# Path 3: assistant-message fallback fields
-if [ -z "$TRANSCRIPT" ]; then
-    TRANSCRIPT="$(printf '%s' "$STDIN_JSON" | jq -r '
-        .last_assistant_message // .assistant_message // .content // empty
-    ' 2>/dev/null)"
-fi
-
-# Path 4: raw stdin (server chunker handles whatever shape)
-if [ -z "$TRANSCRIPT" ]; then
-    TRANSCRIPT="$STDIN_JSON"
-fi
-
-if [ -z "$TRANSCRIPT" ]; then
-    exit 0
-fi
-
-BODY="$(jq -n --arg sid "$SID" --arg tx "$TRANSCRIPT" \
-    '{session_id: $sid, transcript: $tx, source: "codex_cli_plugin"}')"
-
-if ! anamnesis_post "/mcp/tools/log_session" "$BODY" >/dev/null; then
-    anamnesis_queue_payload "/mcp/tools/log_session" "$BODY"
-    anamnesis_log_error "log_session_queued" "sid=$SID"
-fi
-
+# Detached with no fds on the hook's pipes, so Codex does not wait for it.
+anamnesis_stop_worker </dev/null >/dev/null 2>&1 &
 exit 0
