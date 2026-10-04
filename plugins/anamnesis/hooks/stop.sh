@@ -11,6 +11,24 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 anamnesis_load_config || exit 0
 
+# Which Codex rollout records are conversation: the event_msg records Codex
+# shows the user. Codex 0.147-0.150 writes user_message/agent_message;
+# 0.160 writes item_completed with a UserMessage/AgentMessage item. The
+# response_item records also hold injected AGENTS.md and environment
+# context, so they are not read.
+ANAMNESIS_JQ_CODEX='
+  def item_text: [ .content[]? | select((.type // "" | ascii_downcase) == "text") | .text | strings ] | join("\n");
+  def codex_turn:
+    select(.type == "event_msg") | .payload
+    | if .type == "user_message" then ["user", (.message | strings)]
+      elif .type == "agent_message" then ["assistant", (.message | strings)]
+      elif .type == "item_completed" and .item.type == "UserMessage" then ["user", (.item | item_text)]
+      elif .type == "item_completed" and .item.type == "AgentMessage" then ["assistant", (.item | item_text)]
+      else empty end
+    | select(.[1] | length > 0)
+    | .[0] + ": " + .[1];
+'
+
 STDIN_JSON="$(cat)"
 anamnesis_resolve_sid "$STDIN_JSON"
 if [ -z "$ANAMNESIS_SID" ]; then

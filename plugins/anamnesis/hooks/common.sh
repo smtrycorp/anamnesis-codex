@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Helpers sourced by every Anamnesis hook. The Claude Code, Codex and Gemini
-# CLI clients ship byte-identical copies of this file; change all three.
+# Transport, locks, the upload queue and the transcript cursor, sourced by
+# every Anamnesis hook. The Claude Code, Codex and Gemini CLI clients ship
+# byte-identical copies of this file; change all three. What a client's own
+# transcript looks like stays in that client's hooks.
 # Hooks always exit 0: a failure is logged to hook_errors.log (and, for a
 # rejected sign-in, shown to the user once) but never blocks the host CLI.
 # shellcheck disable=SC2034  # globals set here are read by the sourcing hooks
@@ -496,74 +498,19 @@ anamnesis_delta_commit() {
     anamnesis_lock_release "$ANAMNESIS_DELTA_LOCK"
 }
 
-# Which Claude Code transcript records are conversation, decided by the
-# record's own structural fields, never by matching words in the text.
-# Kept: assistant turns, user turns a human typed, and prompts the human
-# queued while Claude worked (a queued_command attachment with origin human).
-# Dropped: queue operations, user records whose origin is not human,
-# isMeta records, compaction summaries (they restate the whole session),
-# system and bookkeeping records, slash-command envelopes (a user record that
-# both opens and closes as a <command-*> or <local-command-*> wrapper),
-# synthetic API-error assistant records, and on Claude Code versions without
-# origin fields, a user record that is entirely a <task-notification>.
-# ANAMNESIS_CAPTURE_FILTER=off keeps every record's text.
-# shellcheck disable=SC2016  # a jq program; $filter is jq's, not the shell's
-ANAMNESIS_JQ_CONVERSATION='
-  def conv_text:
-    if $filter == "on" and .type == "attachment" then (.attachment.prompt // "" | if type == "string" then . else "" end)
+# A short digest of stdin, for file names keyed by a path or an id.
+anamnesis_digest() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -c1-16
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -c1-16
     else
-      (.message.content // .content // .text // "") as $c
-      | if   ($c | type) == "array"  then [ $c[] | select(.type == "text") | (.text // empty) ] | join("\n")
-        elif ($c | type) == "string" then $c
-        else "" end
-    end;
-  def envelope($open; $close):
-    test("^\\s*<(" + $open + ")>") and test("</(" + $close + ")>\\s*$");
-  def is_conversation:
-    if $filter != "on" then true
-    elif .type == "assistant" then ((.isApiErrorMessage // false) | not)
-    elif .type == "user" then
-      ((.isMeta // false) | not)
-      and ((.isCompactSummary // false) | not)
-      and ((.origin == null) or (.origin.kind == "human"))
-      and ((conv_text | envelope("command-name|command-message|local-command-[a-z]+"; "command-[a-z]+|local-command-[a-z]+")) | not)
-      and ((.origin != null) or ((conv_text | envelope("task-notification"; "task-notification")) | not))
-    elif .type == "attachment" then
-      .attachment.type == "queued_command"
-      and .attachment.commandMode == "prompt"
-      and (.attachment.origin.kind == "human")
-    else false end;
-'
-anamnesis_capture_filter_mode() {
-    case "${ANAMNESIS_CAPTURE_FILTER:-on}" in off|OFF|0|false) echo off ;; *) echo on ;; esac
+        cksum | awk '{print $1}'
+    fi
 }
 
-# Which Codex rollout records are conversation: the event_msg records Codex
-# shows the user. Codex 0.147-0.150 writes user_message/agent_message;
-# 0.160 writes item_completed with a UserMessage/AgentMessage item. The
-# response_item records also hold injected AGENTS.md and environment
-# context, so they are not read.
-ANAMNESIS_JQ_CODEX='
-  def item_text: [ .content[]? | select((.type // "" | ascii_downcase) == "text") | .text | strings ] | join("\n");
-  def codex_turn:
-    select(.type == "event_msg") | .payload
-    | if .type == "user_message" then ["user", (.message | strings)]
-      elif .type == "agent_message" then ["assistant", (.message | strings)]
-      elif .type == "item_completed" and .item.type == "UserMessage" then ["user", (.item | item_text)]
-      elif .type == "item_completed" and .item.type == "AgentMessage" then ["assistant", (.item | item_text)]
-      else empty end
-    | select(.[1] | length > 0)
-    | .[0] + ": " + .[1];
-'
-
 anamnesis_transcript_key() {
-    if command -v shasum >/dev/null 2>&1; then
-        printf '%s' "$1" | shasum -a 256 | cut -c1-16
-    elif command -v sha256sum >/dev/null 2>&1; then
-        printf '%s' "$1" | sha256sum | cut -c1-16
-    else
-        printf '%s' "$1" | cksum | awk '{print $1}'
-    fi
+    printf '%s' "$1" | anamnesis_digest
 }
 
 # Receipts (ADR-070) are user-visible status lines sent only as a hook
