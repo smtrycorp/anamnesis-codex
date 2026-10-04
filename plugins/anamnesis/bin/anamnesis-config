@@ -23,8 +23,9 @@
 set -eu
 umask 077
 
-ANAMNESIS_HOME="${ANAMNESIS_HOME:-$HOME/.anamnesis}"
-ANAMNESIS_CONFIG="$ANAMNESIS_HOME/config.json"
+# The hooks' helper, for the lock a running token refresh holds.
+# shellcheck source=../hooks/common.sh
+. "$(cd "$(dirname "$0")/../hooks" && pwd)/common.sh"
 DEFAULT_SERVER="https://anamnesis.smtry.ai"
 
 API_KEY=""
@@ -85,9 +86,11 @@ fi
 # Usage: <json-object> | write_config <json-array-of-keys-to-drop>
 # Merges the object over the existing config, so settings such as
 # "receipts" survive a re-run, and renames it into place so a hook reading
-# at that moment never sees half a file.
+# at that moment never sees half a file. It waits for refresh.lck: a token
+# refresh in flight would otherwise write the previous sign-in's new
+# tokens into this one.
 write_config() {
-    local old="$ANAMNESIS_CONFIG" tmp
+    local old="$ANAMNESIS_CONFIG" tmp lock="$ANAMNESIS_HOME/refresh.lck"
     mkdir -p "$ANAMNESIS_HOME"
     chmod 700 "$ANAMNESIS_HOME"
     jq -e 'type == "object"' "$old" >/dev/null 2>&1 || old=/dev/null
@@ -98,7 +101,13 @@ write_config() {
         echo "anamnesis-config: could not write $ANAMNESIS_CONFIG" >&2
         return 1
     fi
+    if ! anamnesis_lock_acquire "$lock" "$ANAMNESIS_REFRESH_WAIT"; then
+        rm -f "$tmp"
+        echo "anamnesis-config: a token refresh is still running ($lock); try again in a few seconds" >&2
+        return 1
+    fi
     mv -f "$tmp" "$ANAMNESIS_CONFIG"
+    anamnesis_lock_release "$lock" || true
 }
 
 if [ -n "$API_KEY" ]; then

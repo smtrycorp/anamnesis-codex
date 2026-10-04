@@ -126,8 +126,9 @@ anamnesis_refresh_locked() {
         anamnesis_log_error "refresh_failed" "mktemp failed"
         return 1
     fi
-    if ! jq -j '"grant_type=refresh_token&refresh_token=\(.refresh_token | @uri)&client_id=\(.client_id // "" | @uri)"' \
-        < "$ANAMNESIS_CONFIG" > "$dir/form" 2>/dev/null; then
+    if ! cp "$ANAMNESIS_CONFIG" "$dir/before" 2>/dev/null \
+        || ! jq -j '"grant_type=refresh_token&refresh_token=\(.refresh_token | @uri)&client_id=\(.client_id // "" | @uri)"' \
+            < "$dir/before" > "$dir/form" 2>/dev/null; then
         anamnesis_log_error "refresh_failed" "could not build the refresh request from $ANAMNESIS_CONFIG"
         rm -rf "$dir"
         return 1
@@ -141,6 +142,17 @@ anamnesis_refresh_locked() {
         # success could hold a live token.
         anamnesis_log_error "refresh_failed" "HTTP $status $(jq -r '[.error, .error_description] | map(strings) | join(": ")' < "$dir/resp" 2>/dev/null)"
         rm -rf "$dir"
+        return 1
+    fi
+    # The new pair belongs to the sign-in that sent the refresh token. A
+    # sign-in that replaced config.json meanwhile (anamnesis-config takes
+    # refresh.lck, but an older client or a hand edit does not) must not
+    # receive it under its own server URL.
+    if ! jq -e --slurpfile b "$dir/before" \
+        '.server_url == $b[0].server_url and .client_id == $b[0].client_id and .refresh_token == $b[0].refresh_token' \
+        < "$ANAMNESIS_CONFIG" >/dev/null 2>&1; then
+        rm -rf "$dir"
+        anamnesis_log_error "refresh_discarded" "$ANAMNESIS_CONFIG was replaced during the refresh; the new tokens were not kept"
         return 1
     fi
     # A response without refresh_token keeps the current one (RFC 6749 §6).
@@ -174,7 +186,11 @@ anamnesis_request() {
     ANAMNESIS_RESPONSE=""
     ANAMNESIS_SERVER_TIME=""
     anamnesis_capture_enabled || return 1
-    [ "${ANAMNESIS_AUTH_MODE:-}" = "oauth" ] && anamnesis_ensure_token
+    # Without a fresh token the request would only come back 401; the
+    # caller queues or skips instead.
+    if [ "${ANAMNESIS_AUTH_MODE:-}" = "oauth" ] && ! anamnesis_ensure_token; then
+        return 1
+    fi
     if ! dir="$(mktemp -d "${TMPDIR:-/tmp}/anamnesis.XXXXXX")"; then
         anamnesis_log_error "request_skipped" "mktemp failed for $path"
         return 1
