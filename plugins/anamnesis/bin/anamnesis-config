@@ -116,17 +116,19 @@ if [ -n "$API_KEY" ]; then
     trap 'rm -rf "$PROBE_DIR"' EXIT
     # The key goes to curl in a 0600 header file, not on its command line.
     printf 'X-Anamnesis-Key: %s\n' "$API_KEY" > "$PROBE_DIR/auth"
+    # curl prints 000 and exits non-zero when it cannot connect; the
+    # fallback replaces that output rather than appending to it.
     STATUS="$(curl -sS -o "$PROBE_DIR/body" -w '%{http_code}' \
         -X POST "$SERVER/mcp/tools/get_memory_stats" \
         --connect-timeout 5 --max-time 10 \
         -H @"$PROBE_DIR/auth" \
         -H "Content-Type: application/json" \
-        --data '{}' 2>/dev/null || echo "000")"
+        --data '{}' 2>/dev/null)" || STATUS="000"
     case "$STATUS" in
         2*)      echo "  OK (HTTP $STATUS)" ;;
         401|403) echo "  FAILED: HTTP $STATUS — api_key rejected." >&2; exit 1 ;;
         000)     echo "  FAILED: could not reach $SERVER." >&2; exit 1 ;;
-        *)       echo "  WARNING: HTTP $STATUS — proceeding." >&2 ;;
+        *)       echo "  FAILED: $SERVER answered HTTP $STATUS; the key was not checked. Try again later." >&2; exit 1 ;;
     esac
 
     TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -277,12 +279,14 @@ authz_url = f"{SERVER}/oauth/authorize?" + urllib.parse.urlencode({
     "code_challenge":        challenge,
     "code_challenge_method": "S256",
 })
-print(f"Opening {authz_url[:72]}… in your browser.", file=sys.stderr)
-print(f"(If nothing opened, paste that URL manually.)", file=sys.stderr)
+print("Opening this URL in your browser (paste it yourself if nothing opens):", file=sys.stderr)
+print(authz_url, file=sys.stderr)
 try:
-    webbrowser.open(authz_url)
+    opened = webbrowser.open(authz_url)
 except Exception:
-    pass
+    opened = False
+if not opened:
+    print("No browser could be opened here.", file=sys.stderr)
 
 # 5) Wait for the callback.
 if not ready.wait(timeout=TIMEOUT):
