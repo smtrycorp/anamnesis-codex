@@ -1,0 +1,33 @@
+# Hook syntax and lint, then the hooks and the MCP proxy against a
+# stand-in server (tests/mock_server.py).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n and shellcheck
+        run: |
+          for f in plugins/anamnesis/hooks/*.sh plugins/anamnesis/bin/anamnesis plugins/anamnesis/bin/anamnesis-config; do
+            bash -n "$f"
+          done
+          shellcheck -x -S warning plugins/anamnesis/hooks/*.sh plugins/anamnesis/bin/anamnesis plugins/anamnesis/bin/anamnesis-config
+      - name: proxy compiles
+        run: python3 -m py_compile plugins/anamnesis/bin/anamnesis-mcp-proxy
+
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: hook tests
+        run: bash tests/test_hooks.sh
+      - name: proxy tests
+        run: python3 -m unittest -v tests.test_proxy
