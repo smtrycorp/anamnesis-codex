@@ -19,6 +19,6 @@ anamnesis_write_session_id "$ANAMNESIS_SID"
 anamnesis_start_background_sync
 anamnesis_gap_notice
 if [ -n "$ANAMNESIS_GAP_CTX" ]; then
-    jq -n --arg ctx "$ANAMNESIS_GAP_CTX" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'
+    printf '%s' "$ANAMNESIS_GAP_CTX" | jq -Rs '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: .}}'
 fi
 exit 0

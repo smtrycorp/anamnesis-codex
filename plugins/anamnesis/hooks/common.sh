@@ -538,9 +538,11 @@ ANAMNESIS_JQ_DEFANG='def defang: gsub("<(?<t>\\s*/?\\s*anamnesis)"; "&lt;\(.t)";
 # lines (if any) and a date/time anchor that goes out on every turn.
 anamnesis_prompt_hook() {
     local event="$1" receipt="$2" query lines count status msg="" addl
+    # The server takes a query of at most 4,000 characters; a longer prompt
+    # is searched by its opening.
     query="$(printf '%s' "$ANAMNESIS_STDIN" | jq -c --arg sid "$ANAMNESIS_SID" '
         select(.prompt | type == "string" and length > 0)
-        | {query: .prompt, top_n: 5, mode: "hierarchical", detail_level: "standard",
+        | {query: (.prompt | .[0:4000]), top_n: 5, mode: "hierarchical", detail_level: "standard",
            min_similarity: 0.35, diversity: 0.3}
           + (if $sid == "" then {} else {session_id: $sid} end)' 2>/dev/null)"
     [ -n "$query" ] || return 0
@@ -582,8 +584,10 @@ anamnesis_prompt_hook() {
             + (map("- " + .) | join("\n")) + "\n</anamnesis-context>\n"
          else "" end)
         + "<current-datetime local=\"\($local)\"" + (if $utc == "" then "" else " server-utc=\"\($utc)\"" end) + " source=\"anamnesis\"/>"')"
-    jq -n --arg ev "$event" --arg ctx "$addl" --arg msg "$msg" '
-        {hookSpecificOutput: {hookEventName: $ev, additionalContext: $ctx}}
+    # Recalled text goes to jq on stdin, not as an argument any user on the
+    # machine could read from the process list.
+    printf '%s' "$addl" | jq -Rs --arg ev "$event" --arg msg "$msg" '
+        {hookSpecificOutput: {hookEventName: $ev, additionalContext: .}}
         + (if $msg == "" then {} else {systemMessage: $msg} end)'
 }
 
