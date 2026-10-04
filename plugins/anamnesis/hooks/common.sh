@@ -617,8 +617,60 @@ anamnesis_delta_begin() {
     return 0
 }
 
-# Records the delta as sent (a failed send was queued, so the queue owns it
-# now) and releases the lock.
+# The server's SessionLogRequest limit on one transcript, in characters (jq
+# and the server both count code points).
+ANAMNESIS_TRANSCRIPT_MAX=2000000
+
+# Usage: anamnesis_send_turns <session-id> <extra-fields-json> < turns
+# Reads turns, one JSON string per line as jq -c writes them, and uploads
+# them as log_session calls that each fit the server's transcript limit; a
+# single turn longer than the limit is cut to it and logged. A call the
+# server does not take is queued. Returns 0 when every call was delivered
+# or durably queued, so the caller may move past these turns, and 1 when
+# one was lost; ANAMNESIS_DELIVERED counts the calls the server took.
+anamnesis_send_turns() {
+    local sid="$1" extra="${2:-{\}}" bodies body cut rc=0
+    ANAMNESIS_DELIVERED=0
+    if ! bodies="$(mktemp "$ANAMNESIS_STATE_DIR/.send.XXXXXX")"; then
+        anamnesis_log_error "capture_failed" "mktemp failed (sid=$sid)"
+        return 1
+    fi
+    # First line: how many turns were cut. Then one log_session body per
+    # line, each as full as the limit allows.
+    if ! jq -sr --arg sid "$sid" --argjson extra "$extra" --argjson max "$ANAMNESIS_TRANSCRIPT_MAX" '
+        [.[] | strings] as $turns
+        | ([$turns[] | select(length > $max)] | length),
+          ([$turns[] | if length > $max then .[0:$max] else . end]
+           | reduce .[] as $t ({chunks: [], cur: [], len: 0};
+               (if (.cur | length) == 0 then 0 else 1 end) as $sep
+               | if (.cur | length) > 0 and .len + $sep + ($t | length) > $max
+                 then {chunks: (.chunks + [.cur]), cur: [$t], len: ($t | length)}
+                 else {chunks: .chunks, cur: (.cur + [$t]), len: (.len + $sep + ($t | length))} end)
+           | .chunks + (if (.cur | length) > 0 then [.cur] else [] end)
+           | .[] | {session_id: $sid, transcript: join("\n")} + $extra | tojson)' > "$bodies" 2>/dev/null; then
+        rm -f "$bodies"
+        anamnesis_log_error "capture_failed" "could not build the log_session payload (sid=$sid)"
+        return 1
+    fi
+    {
+        IFS= read -r cut
+        [ "${cut:-0}" -gt 0 ] 2>/dev/null && anamnesis_log_error "capture_truncated" "$cut turn(s) longer than $ANAMNESIS_TRANSCRIPT_MAX characters were cut to it (sid=$sid)"
+        while IFS= read -r body; do
+            if anamnesis_post "/mcp/tools/log_session" "$body" >/dev/null; then
+                ANAMNESIS_DELIVERED=$((ANAMNESIS_DELIVERED + 1))
+            elif anamnesis_queue_payload "/mcp/tools/log_session" "$body"; then
+                anamnesis_log_error "log_session_queued" "sid=$sid"
+            else
+                rc=1
+            fi
+        done
+    } < "$bodies"
+    rm -f "$bodies"
+    return $rc
+}
+
+# Records the delta as sent (delivered, or queued and so the queue's now)
+# and releases the lock.
 anamnesis_delta_commit() {
     local tmp
     if ! { tmp="$(mktemp "$ANAMNESIS_DELTA_STATE.XXXXXX")" \
@@ -628,6 +680,13 @@ anamnesis_delta_commit() {
         [ -n "${tmp:-}" ] && rm -f "$tmp"
         anamnesis_log_error "state_write_failed" "$ANAMNESIS_DELTA_STATE; the next turn resends this delta"
     fi
+    anamnesis_lock_release "$ANAMNESIS_DELTA_LOCK"
+}
+
+# Releases the lock without recording the delta: a delta that was neither
+# delivered nor queued is picked up again by the next turn.
+anamnesis_delta_abandon() {
+    anamnesis_log_error "capture_deferred" "neither uploaded nor queued; the next turn resends from the same place ($ANAMNESIS_DELTA_PATH)"
     anamnesis_lock_release "$ANAMNESIS_DELTA_LOCK"
 }
 

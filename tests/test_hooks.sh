@@ -113,6 +113,18 @@ printf '{"session_id":"s","transcript_path":"%s"}' "$T" | "$HOOKS/stop.sh" >/dev
 for _ in $(seq 60); do [ "$(count_req log_session)" -gt 0 ] && break; sleep 0.5; done
 check "1.5 MB turn uploads (no ARG_MAX failure)" "$(sent_transcript | awk 'length > 1500000' | wc -l | tr -d ' ')" 1
 
+# A delta that was neither uploaded nor queued is sent by the next Stop.
+new_home
+rollout new
+routes '{"/mcp/tools/log_session": {"status": 500}}'
+chmod 500 "$ANAMNESIS_HOME/pending_uploads"
+stop "$T" >/dev/null
+check "double failure: cursor not advanced" "$(cat "$ANAMNESIS_HOME"/stop_state/*.json 2>/dev/null | jq -r .lines_sent)" ""
+chmod 700 "$ANAMNESIS_HOME/pending_uploads"
+routes '{}'
+stop "$T" >/dev/null
+check "double failure: the next Stop resends the delta" "$(sent_transcript | grep -c '^user: remember the blue door$')" 1
+
 new_home
 routes '{"/mcp/tools/retrieve_memories": {"status": 401}}'
 m1="$(echo '{"prompt":"q","session_id":"s1"}' | "$HOOKS/user-prompt-submit.sh" | jq -r '.systemMessage // empty')"

@@ -58,13 +58,9 @@ anamnesis_stop_worker() {
     turns="$(printf '%s\n' "$ANAMNESIS_DELTA" | jq -cR "$ANAMNESIS_JQ_CODEX"' fromjson? | codex_turn' 2>/dev/null)"
     if [ -z "$turns" ]; then
         anamnesis_log_error "capture_skipped" "no conversation records in the new rollout lines (sid=$ANAMNESIS_SID)"
-    else
-        body="$(printf '%s\n' "$turns" | jq -sc --arg sid "$ANAMNESIS_SID" \
-            '{session_id: $sid, transcript: join("\n"), source: "codex_cli_plugin"}')"
-        if ! anamnesis_post "/mcp/tools/log_session" "$body" >/dev/null; then
-            anamnesis_queue_payload "/mcp/tools/log_session" "$body"
-            anamnesis_log_error "log_session_queued" "sid=$ANAMNESIS_SID"
-        fi
+    elif ! anamnesis_send_turns "$ANAMNESIS_SID" '{"source": "codex_cli_plugin"}' <<<"$turns"; then
+        anamnesis_delta_abandon
+        return 0
     fi
     anamnesis_delta_commit
 }
