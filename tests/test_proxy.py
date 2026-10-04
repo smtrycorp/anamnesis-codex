@@ -163,6 +163,36 @@ class ProxyTest(unittest.TestCase):
         self.assertIn("result", reply)
         self.assertFalse(os.path.lexists(os.path.join(self.home, "refresh.lck")))
 
+    def test_stale_lock_is_left_alone_while_another_process_holds_its_guard(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        live = subprocess.Popen(["sleep", "30"])
+        lock = os.path.join(self.home, "refresh.lck")
+        os.symlink(str(dead.pid), lock)
+        os.symlink(str(live.pid), lock + ".guard")
+        self.write_config(access_token="at0", refresh_token="rt0", expires_at=0)
+        proxy = self.start()
+        reply = self.call(proxy, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.finish(proxy)
+        live.kill()
+        live.wait()
+        self.assertIn("holds refresh.lck", reply["error"]["message"])
+        self.assertEqual(os.readlink(lock), str(dead.pid))
+
+    def test_a_dead_processes_guard_does_not_block_a_reclaim(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        lock = os.path.join(self.home, "refresh.lck")
+        os.symlink(str(dead.pid), lock)
+        os.symlink(str(dead.pid), lock + ".guard")
+        self.write_config(access_token="at0", refresh_token="rt0", expires_at=0)
+        proxy = self.start()
+        reply = self.call(proxy, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.finish(proxy)
+        self.assertIn("result", reply)
+        self.assertFalse(os.path.lexists(lock))
+        self.assertFalse(os.path.lexists(lock + ".guard"))
+
     def test_non_object_line_is_rejected_and_proxy_keeps_going(self):
         proxy = self.start()
         proxy.stdin.write("[1, 2]\n")

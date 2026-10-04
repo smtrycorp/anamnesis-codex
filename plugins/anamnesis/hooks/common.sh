@@ -281,21 +281,17 @@ anamnesis_self_pid() {
 # Usage: anamnesis_lock_acquire <lock-path> <max-half-seconds>
 # The lock is a symlink whose target is the holder's PID, so taking it and
 # naming the holder is one atomic step. A lock whose holder is dead is
-# stolen; returns 1 if a live holder keeps it past the wait.
+# reclaimed; returns 1 if a live holder keeps it past the wait. It is not
+# flock(2) because macOS ships no flock(1), bash 3.2 cannot lock a
+# descriptor, and the Codex MCP proxy takes refresh.lck from Python, so the
+# lock has to be a filesystem object both can take by the same rules.
 anamnesis_lock_acquire() {
-    local lock="$1" max="$2" waited=0 holder
+    local lock="$1" max="$2" waited=0
     anamnesis_self_pid || return 1
     while ! ln -sn "$ANAMNESIS_SELF_PID" "$lock" 2>/dev/null; do
-        holder="$(readlink "$lock" 2>/dev/null)"
-        case "$holder" in
-            ''|*[!0-9]*) ;;
-            *)
-                if ! kill -0 "$holder" 2>/dev/null; then
-                    anamnesis_lock_steal "$lock" "$holder"
-                    waited=$((waited + 1))
-                    continue
-                fi ;;
-        esac
+        # A reclaim that succeeded removed a dead holder's link, so retrying
+        # at once cannot loop unless a holder dies every time.
+        anamnesis_lock_reclaim "$lock" && continue
         waited=$((waited + 1))
         [ "$waited" -gt "$max" ] && return 1
         sleep 0.5
@@ -303,19 +299,59 @@ anamnesis_lock_acquire() {
     return 0
 }
 
-# Renames the lock aside before removing it, so a stealer that lost a race
-# to a live taker puts that taker's lock back instead of deleting it.
-anamnesis_lock_steal() {
-    local aside="$1.stale.$ANAMNESIS_SELF_PID" target
-    mv "$1" "$aside" 2>/dev/null || return 0
-    target="$(readlink "$aside" 2>/dev/null)"
-    [ "$target" = "$2" ] || ln -sn "$target" "$1" 2>/dev/null
-    rm -f "$aside"
+# Removes <lock> when its holder is dead (or is not a PID at all, so no
+# process can hold it); returns 0 only when it removed the link. Removal,
+# here and in anamnesis_lock_release, happens under the lock's guard link,
+# and the holder is read after the guard is taken: while the guard is held
+# nothing else can remove or replace the link, and a dead holder stays
+# dead, so the link removed is the one that was checked. Renaming the lock
+# aside and checking afterwards, the previous scheme, could move a live
+# taker's lock and leave two holders.
+anamnesis_lock_reclaim() {
+    local lock="$1" holder removed=1
+    anamnesis_lock_guard_take "$lock" || return 1
+    holder="$(readlink "$lock" 2>/dev/null)"
+    case "$holder" in
+        '') ;;
+        *[!0-9]*) rm -f "$lock" && removed=0 ;;
+        *) kill -0 "$holder" 2>/dev/null || { rm -f "$lock" && removed=0; } ;;
+    esac
+    anamnesis_lock_guard_release "$lock"
+    return $removed
 }
 
-# Releases a lock only if this process holds it.
+# The guard is held for a few milliseconds, so a guard whose holder is
+# dead was left by a process killed inside that window and is removed.
+# Two reclaimers meeting such a guard in the same instant could both
+# remove it, which is the one window this scheme leaves open.
+anamnesis_lock_guard_take() {
+    local guard="$1.guard" tries=0 holder
+    while ! ln -sn "$ANAMNESIS_SELF_PID" "$guard" 2>/dev/null; do
+        holder="$(readlink "$guard" 2>/dev/null)"
+        case "$holder" in
+            ''|*[!0-9]*) ;;
+            *) kill -0 "$holder" 2>/dev/null || rm -f "$guard" ;;
+        esac
+        tries=$((tries + 1))
+        [ "$tries" -gt 10 ] && return 1
+        sleep 0.1
+    done
+    return 0
+}
+
+anamnesis_lock_guard_release() {
+    [ "$(readlink "$1.guard" 2>/dev/null)" = "${ANAMNESIS_SELF_PID:-}" ] && rm -f "$1.guard"
+    return 0
+}
+
+# Releases a lock only if this process holds it. A guard that cannot be
+# taken within a second is held by a process stuck inside its window; the
+# release goes ahead rather than leave this lock behind for as long as this
+# process lives (the MCP proxy lives for a whole session).
 anamnesis_lock_release() {
+    anamnesis_lock_guard_take "$1" || anamnesis_log_error "lock_guard_stuck" "$1.guard; released without it"
     [ "$(readlink "$1" 2>/dev/null)" = "${ANAMNESIS_SELF_PID:-}" ] && rm -f "$1"
+    anamnesis_lock_guard_release "$1"
     return 0
 }
 

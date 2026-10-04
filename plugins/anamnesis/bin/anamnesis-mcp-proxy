@@ -8,7 +8,8 @@ credentials in ~/.anamnesis/config.json, and the reply goes to stdout.
 The capture hooks rotate the OAuth refresh token too, and the server rejects
 a rotated-out one. So the proxy re-reads config.json for every request,
 refreshes only under the same refresh.lck lock the hooks use (a symlink
-naming the holder's PID), and re-reads config.json after taking it. A
+naming the holder's PID, removed only under its guard link), and re-reads
+config.json after taking it. A
 refresh that still fails is reported on stderr and returned as the tool
 error.
 
@@ -129,7 +130,8 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _lock(path: str, wait_s: float) -> bool:
-    """Takes the hooks' symlink lock; steals it only from a dead holder."""
+    """Takes the hooks' symlink lock (target: the holder's PID) by the hooks'
+    rules: a dead holder's lock is reclaimed, a live holder's is waited for."""
     me = str(os.getpid())
     deadline = time.monotonic() + wait_s
     while True:
@@ -138,36 +140,79 @@ def _lock(path: str, wait_s: float) -> bool:
             return True
         except FileExistsError:
             pass
-        try:
-            holder = os.readlink(path)
-        except OSError:
-            holder = ""
-        if holder.isdigit() and not _pid_alive(int(holder)):
-            aside = f"{path}.stale.{me}"
-            try:
-                os.rename(path, aside)
-            except OSError:
-                continue
-            # Lost a race to a live taker: put its lock back.
-            target = os.readlink(aside)
-            if target != holder:
-                try:
-                    os.symlink(target, path)
-                except FileExistsError:
-                    pass
-            os.unlink(aside)
+        # A reclaim that succeeded removed a dead holder's link, so retrying
+        # at once cannot loop unless a holder dies every time.
+        if _reclaim(path):
             continue
         if time.monotonic() > deadline:
             return False
         time.sleep(0.1)
 
 
-def _unlock(path: str) -> None:
+def _holder(path: str) -> str:
     try:
-        if os.readlink(path) == str(os.getpid()):
-            os.unlink(path)
+        return os.readlink(path)
     except OSError:
-        pass
+        return ""
+
+
+def _reclaim(path: str) -> bool:
+    """Removes the lock when its holder is dead (or is not a PID at all);
+    True only when it removed the link. Removal, here and in _unlock, runs
+    under the lock's guard link and reads the holder after taking it, so a
+    link that a live process took between the check and the removal is
+    never removed; renaming aside and checking afterwards could be."""
+    if not _guard_take(path):
+        return False
+    try:
+        holder = _holder(path)
+        if not holder or (holder.isdigit() and _pid_alive(int(holder))):
+            return False
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        _guard_release(path)
+
+
+def _guard_take(path: str) -> bool:
+    """The guard is held for a few milliseconds; one whose holder is dead
+    was left by a process killed in that window and is removed."""
+    me = str(os.getpid())
+    for _ in range(10):
+        try:
+            os.symlink(me, f"{path}.guard")
+            return True
+        except FileExistsError:
+            pass
+        holder = _holder(f"{path}.guard")
+        if holder.isdigit() and not _pid_alive(int(holder)):
+            try:
+                os.unlink(f"{path}.guard")
+            except OSError:
+                pass
+        time.sleep(0.1)
+    return False
+
+
+def _guard_release(path: str) -> None:
+    if _holder(f"{path}.guard") == str(os.getpid()):
+        try:
+            os.unlink(f"{path}.guard")
+        except OSError:
+            pass
+
+
+def _unlock(path: str) -> None:
+    if not _guard_take(path):
+        _log(f"{path}.guard is stuck; releasing without it")
+    if _holder(path) == str(os.getpid()):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    _guard_release(path)
 
 
 def _fresh(cfg: dict) -> bool:
