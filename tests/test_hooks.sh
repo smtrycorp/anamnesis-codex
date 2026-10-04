@@ -113,6 +113,20 @@ printf '{"session_id":"s","transcript_path":"%s"}' "$T" | "$HOOKS/stop.sh" >/dev
 for _ in $(seq 60); do [ "$(count_req log_session)" -gt 0 ] && break; sleep 0.5; done
 check "1.5 MB turn uploads (no ARG_MAX failure)" "$(sent_transcript | awk 'length > 1500000' | wc -l | tr -d ' ')" 1
 
+# Turns that end while capture is paused never upload, not even after resume.
+new_home
+rollout new
+stop "$T" >/dev/null
+touch "$ANAMNESIS_HOME/paused"
+echo '{"type":"event_msg","payload":{"type":"user_message","message":"said while paused"}}' >> "$T"
+stop "$T" >/dev/null
+rm -f "$ANAMNESIS_HOME/paused"
+echo '{"type":"event_msg","payload":{"type":"user_message","message":"said after resume"}}' >> "$T"
+stop "$T" >/dev/null
+check "paused turn skipped, logged as such" "$(grep -c capture_skipped_off "$ANAMNESIS_HOME/hook_errors.log")" 1
+check "paused turn never uploaded" "$(grep -c 'said while paused' "$SRV/requests")" 0
+check "turn after resume uploaded alone" "$(sent_transcript)" "user: said after resume"
+
 # A delta that was neither uploaded nor queued is sent by the next Stop.
 new_home
 rollout new

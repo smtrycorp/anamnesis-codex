@@ -9,6 +9,21 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$HOOK_DIR/common.sh"
 
+STDIN_JSON="$(cat)"
+TRANSCRIPT_PATH="$(printf '%s' "$STDIN_JSON" | jq -r '.transcript_path // empty | strings' 2>/dev/null)"
+# Only rollouts under Codex's own sessions directory: the path comes from
+# the hook payload and the file is uploaded.
+case "$TRANSCRIPT_PATH" in
+    *..*) TRANSCRIPT_PATH="" ;;
+    "${CODEX_HOME:-$HOME/.codex}"/sessions/*.jsonl) ;;
+    *) TRANSCRIPT_PATH="" ;;
+esac
+if ! anamnesis_capture_enabled; then
+    # Paused or switched off: skip this turn for good, or it would upload
+    # with the first turn after resume.
+    anamnesis_delta_skip "$TRANSCRIPT_PATH" </dev/null >/dev/null 2>&1 &
+    exit 0
+fi
 anamnesis_load_config || exit 0
 
 # Which Codex rollout records are conversation: the event_msg records Codex
@@ -29,27 +44,18 @@ ANAMNESIS_JQ_CODEX='
     | .[0] + ": " + .[1];
 '
 
-STDIN_JSON="$(cat)"
 anamnesis_resolve_sid "$STDIN_JSON"
 if [ -z "$ANAMNESIS_SID" ]; then
     ANAMNESIS_SID="recovered-$(date -u +"%Y%m%dT%H%M%SZ")"
     anamnesis_write_session_id "$ANAMNESIS_SID"
 fi
-TRANSCRIPT_PATH="$(printf '%s' "$STDIN_JSON" | jq -r '.transcript_path // empty | strings' 2>/dev/null)"
 
 if anamnesis_auth_warning_due; then
     jq -n --arg msg "$ANAMNESIS_AUTH_WARNING" '{systemMessage: $msg}'
 fi
 
 anamnesis_stop_worker() {
-    local turns body
-    # Only rollouts under Codex's own sessions directory: the path comes
-    # from the hook payload and the file is uploaded.
-    case "$TRANSCRIPT_PATH" in
-        *..*) TRANSCRIPT_PATH="" ;;
-        "${CODEX_HOME:-$HOME/.codex}"/sessions/*.jsonl) ;;
-        *) TRANSCRIPT_PATH="" ;;
-    esac
+    local turns
     if [ -z "$TRANSCRIPT_PATH" ] || [ ! -r "$TRANSCRIPT_PATH" ]; then
         anamnesis_log_error "capture_skipped" "no readable Codex rollout in the Stop payload"
         return 0

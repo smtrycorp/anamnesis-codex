@@ -683,6 +683,19 @@ anamnesis_delta_commit() {
     anamnesis_lock_release "$ANAMNESIS_DELTA_LOCK"
 }
 
+# Usage: anamnesis_delta_skip <transcript-path>
+# Moves the cursor past everything in the transcript without uploading it,
+# for a Stop that fires while capture is off: the turns that ended while
+# the user had capture paused must not go up with the first turn after
+# resume. A turn in flight when capture resumes ends after it and is
+# captured.
+anamnesis_delta_skip() {
+    [ -n "$1" ] && [ -r "$1" ] || return 0
+    anamnesis_delta_begin "$1" || return 0
+    anamnesis_log_error "capture_skipped_off" "turns that ended while capture was off were skipped for good: $1"
+    anamnesis_delta_commit
+}
+
 # Releases the lock without recording the delta: a delta that was neither
 # delivered nor queued is picked up again by the next turn.
 anamnesis_delta_abandon() {
