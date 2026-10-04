@@ -32,8 +32,12 @@ case "$SUB" in
             RESUMED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
             # The next SessionStart names this window once, so the assistant
             # can offer to backfill decisions made while nothing was captured.
-            printf '{"paused_at":"%s","resumed_at":"%s","surfaced":false}\n' \
-                "$PAUSED_AT" "$RESUMED_AT" > "$ANAMNESIS_HOME/last_gap.json"
+            # jq encodes the pause file's contents, whatever they hold.
+            if ! command -v jq >/dev/null 2>&1 \
+                || ! jq -n --arg p "$PAUSED_AT" --arg r "$RESUMED_AT" \
+                    '{paused_at: $p, resumed_at: $r, surfaced: false}' > "$ANAMNESIS_HOME/last_gap.json"; then
+                echo "anamnesis: could not record the capture gap (jq missing or $ANAMNESIS_HOME not writable)." >&2
+            fi
             rm -f "$PAUSE_FILE"
             echo "anamnesis: resumed."
             echo "  capture was OFF from $PAUSED_AT to $RESUMED_AT."
