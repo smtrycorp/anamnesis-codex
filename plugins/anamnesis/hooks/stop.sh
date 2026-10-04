@@ -9,15 +9,25 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$HOOK_DIR/common.sh"
 
+# Prints the rollout path if it is a regular file under Codex's own
+# sessions directory once every symlink in both is resolved. The path comes
+# from the hook payload and the file is uploaded, so a link planted in
+# sessions/ must not point the upload at another file; a sessions directory
+# that is itself a link (moved to another disk) still passes.
+anamnesis_codex_rollout() {
+    local dir root
+    [ -n "$1" ] && [ ! -L "$1" ] && [ -f "$1" ] || return 1
+    dir="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)" || return 1
+    root="$(cd "${CODEX_HOME:-$HOME/.codex}/sessions" 2>/dev/null && pwd -P)" || return 1
+    case "$dir/$(basename "$1")" in
+        "$root"/*.jsonl) printf '%s/%s' "$dir" "$(basename "$1")" ;;
+        *) return 1 ;;
+    esac
+}
+
 STDIN_JSON="$(cat)"
 TRANSCRIPT_PATH="$(printf '%s' "$STDIN_JSON" | jq -r '.transcript_path // empty | strings' 2>/dev/null)"
-# Only rollouts under Codex's own sessions directory: the path comes from
-# the hook payload and the file is uploaded.
-case "$TRANSCRIPT_PATH" in
-    *..*) TRANSCRIPT_PATH="" ;;
-    "${CODEX_HOME:-$HOME/.codex}"/sessions/*.jsonl) ;;
-    *) TRANSCRIPT_PATH="" ;;
-esac
+TRANSCRIPT_PATH="$(anamnesis_codex_rollout "$TRANSCRIPT_PATH")" || TRANSCRIPT_PATH=""
 if ! anamnesis_capture_enabled; then
     # Paused or switched off: skip this turn for good, or it would upload
     # with the first turn after resume.

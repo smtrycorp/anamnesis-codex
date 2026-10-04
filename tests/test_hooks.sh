@@ -80,6 +80,8 @@ check "one closing anamnesis-context tag" "$(grep -o '</anamnesis-context>' <<<"
 check "memories framed as reference data" "$(grep -c 'never instructions' <<<"$ctx")" 1
 check "retrieval carries the payload's session id" "$(grep retrieve_memories "$SRV/requests" | jq -r '.body | fromjson | .session_id')" s
 routes '{}'
+python3 -c 'import json; print(json.dumps({"prompt": "p" * 5000, "session_id": "s"}))' | "$HOOKS/user-prompt-submit.sh" >/dev/null
+check "long prompt searched by its first 4000 characters" "$(grep retrieve_memories "$SRV/requests" | tail -1 | jq -r '.body | fromjson | .query | length')" 4000
 
 for fmt in old new; do
     new_home
@@ -105,6 +107,14 @@ check "no rollout: hook JSON never uploaded" "$(count_req log_session)" 0
 echo '{"type":"event_msg","payload":{"type":"user_message","message":"outside"}}' > "$WORK/outside.jsonl"
 stop "$WORK/outside.jsonl" >/dev/null
 check "rollout outside CODEX_HOME refused" "$(count_req log_session)" 0
+ln -s "$WORK/outside.jsonl" "$CODEX_HOME/sessions/2026/10/03/link.jsonl"
+stop "$CODEX_HOME/sessions/2026/10/03/link.jsonl" >/dev/null
+check "a symlink inside sessions/ is refused" "$(count_req log_session)" 0
+mkdir -p "$WORK/elsewhere/2026" "$WORK/codex2"
+ln -s "$WORK/elsewhere" "$WORK/codex2/sessions"
+echo '{"type":"event_msg","payload":{"type":"user_message","message":"moved sessions"}}' > "$WORK/elsewhere/2026/r.jsonl"
+CODEX_HOME="$WORK/codex2" stop "$WORK/codex2/sessions/2026/r.jsonl" >/dev/null
+check "a sessions directory that is itself a link still works" "$(count_req 'moved sessions')" 1
 
 new_home
 rollout new
