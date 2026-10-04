@@ -15,3 +15,6 @@
 
 # Claude Code per-machine permission state (never commit — user-specific)
 .claude/settings.local.json
+
+# Python bytecode
+__pycache__/

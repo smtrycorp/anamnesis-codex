@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-# anamnesis-config — one-time setup for the Anamnesis Claude Code plugin.
+# anamnesis-config — one-time setup for the Anamnesis client plugins
+# (Claude Code, Codex, Gemini CLI). All three read ~/.anamnesis/config.json.
 #
 # Interactive mode (default): runs the OAuth 2.1 + PKCE browser flow.
 #   Opens anamnesis.smtry.ai/oauth/authorize in your browser, you paste
 #   your api_key once, approve the scopes, return to the terminal.
 #   Access + refresh tokens land in ~/.anamnesis/config.json (mode 0600);
-#   no api_key ever stored. This is the target end-state for the
-#   2026-05-20 legacy-auth deprecation.
+#   the api_key is not stored.
 #
-# Scripted mode (legacy, deprecating 2026-05-20):
-#   --api-key anm_... --handle jia    store api_key directly, skip OAuth.
-#   Kept for CI / headless installs during the migration window. Prints a
-#   deprecation hint; switch to interactive mode before 2026-05-20.
+# Scripted mode (legacy): --api-key - --handle jia reads the api_key from
+#   stdin and stores it in config.json, skipping OAuth. Hooks then send it as
+#   the X-Anamnesis-Key header. A key given as --api-key anm_... also works
+#   but sits in the process list and shell history.
 #
 # Usage:
 #   anamnesis-config                                   (interactive OAuth)
 #   anamnesis-config --handle jia                      (prefill handle)
 #   anamnesis-config --allow-delete                    (also request memory.delete scope)
-#   anamnesis-config --api-key anm_... --handle jia    (scripted, legacy)
+#   anamnesis-config --api-key - --handle jia < key    (scripted, legacy)
 #   anamnesis-config --server https://alt.example.com  (self-host)
 
 set -eu
+umask 077
 
 ANAMNESIS_HOME="${ANAMNESIS_HOME:-$HOME/.anamnesis}"
 ANAMNESIS_CONFIG="$ANAMNESIS_HOME/config.json"
@@ -38,11 +39,18 @@ while [ $# -gt 0 ]; do
         --server)        SERVER="$2"; shift 2 ;;
         --allow-delete)  ALLOW_DELETE="1"; shift ;;
         --help|-h)
-            sed -n '2,24p' "$0" | sed 's/^# //; s/^#//'
+            sed -n '2,23p' "$0" | sed 's/^# //; s/^#//'
             exit 0 ;;
         *) echo "unknown flag: $1" >&2; exit 2 ;;
     esac
 done
+if [ "$API_KEY" = "-" ]; then
+    IFS= read -r API_KEY || true
+    if [ -z "$API_KEY" ]; then
+        echo "anamnesis-config: --api-key - expects the key on stdin" >&2
+        exit 2
+    fi
+fi
 
 # --- dependency check ---
 # curl + jq are always needed. python3 is needed for OAuth (interactive
@@ -74,22 +82,37 @@ if [ -z "$HANDLE" ]; then
     exit 2
 fi
 
-# =============================================================================
-# SCRIPTED / LEGACY MODE — skip OAuth if --api-key was given.
-# =============================================================================
-if [ -n "$API_KEY" ]; then
-    echo "anamnesis-config: --api-key mode is deprecated and stops working 2026-05-20." >&2
-    echo "                  Run without --api-key for the OAuth flow." >&2
-    echo
+# Usage: <json-object> | write_config <json-array-of-keys-to-drop>
+# Merges the object over the existing config, so settings such as
+# "receipts" survive a re-run, and renames it into place so a hook reading
+# at that moment never sees half a file.
+write_config() {
+    local old="$ANAMNESIS_CONFIG" tmp
+    mkdir -p "$ANAMNESIS_HOME"
+    chmod 700 "$ANAMNESIS_HOME"
+    jq -e 'type == "object"' "$old" >/dev/null 2>&1 || old=/dev/null
+    tmp="$(mktemp "$ANAMNESIS_CONFIG.XXXXXX")"
+    if ! jq --slurpfile old "$old" --argjson drop "$1" \
+        '(($old[0] // {}) | delpaths($drop | map([.]))) + .' > "$tmp"; then
+        rm -f "$tmp"
+        echo "anamnesis-config: could not write $ANAMNESIS_CONFIG" >&2
+        return 1
+    fi
+    mv -f "$tmp" "$ANAMNESIS_CONFIG"
+}
 
+if [ -n "$API_KEY" ]; then
     echo "Validating against $SERVER …"
-    STATUS="$(curl -sS -o /tmp/anamnesis_cfg_probe.$$ -w '%{http_code}' \
+    PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/anamnesis-config.XXXXXX")"
+    trap 'rm -rf "$PROBE_DIR"' EXIT
+    # The key goes to curl in a 0600 header file, not on its command line.
+    printf 'X-Anamnesis-Key: %s\n' "$API_KEY" > "$PROBE_DIR/auth"
+    STATUS="$(curl -sS -o "$PROBE_DIR/body" -w '%{http_code}' \
         -X POST "$SERVER/mcp/tools/get_memory_stats" \
-        --max-time 10 \
-        -H "X-Anamnesis-Key: $API_KEY" \
+        --connect-timeout 5 --max-time 10 \
+        -H @"$PROBE_DIR/auth" \
         -H "Content-Type: application/json" \
         --data '{}' 2>/dev/null || echo "000")"
-    rm -f /tmp/anamnesis_cfg_probe.$$ 2>/dev/null || true
     case "$STATUS" in
         2*)      echo "  OK (HTTP $STATUS)" ;;
         401|403) echo "  FAILED: HTTP $STATUS — api_key rejected." >&2; exit 1 ;;
@@ -97,24 +120,18 @@ if [ -n "$API_KEY" ]; then
         *)       echo "  WARNING: HTTP $STATUS — proceeding." >&2 ;;
     esac
 
-    mkdir -p "$ANAMNESIS_HOME"
-    chmod 700 "$ANAMNESIS_HOME"
     TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    jq -n \
-        --arg api_key "$API_KEY" \
-        --arg handle  "$HANDLE" \
-        --arg server  "$SERVER" \
-        --arg ts      "$TS" \
-        '{api_key: $api_key, handle: $handle, server_url: $server, created_at: $ts, auth_mode: "legacy"}' \
-        > "$ANAMNESIS_CONFIG"
-    chmod 600 "$ANAMNESIS_CONFIG"
+    # The key reaches jq through its environment, which other accounts
+    # cannot read, rather than its arguments, which they can.
+    ANAMNESIS_NEW_KEY="$API_KEY" jq -n --arg handle "$HANDLE" --arg server "$SERVER" --arg ts "$TS" \
+        '{api_key: env.ANAMNESIS_NEW_KEY, handle: $handle, server_url: $server, created_at: $ts, auth_mode: "legacy"}' \
+        | write_config '["access_token", "refresh_token", "expires_at", "client_id", "scope"]'
 
     cat <<EOM
 
-Anamnesis config written to $ANAMNESIS_CONFIG (mode 0600) in LEGACY mode.
-
-Re-run 'anamnesis-config' (without --api-key) before 2026-05-20 to upgrade
-to the OAuth flow. After that date, api_key header auth returns 401.
+Anamnesis config written to $ANAMNESIS_CONFIG (mode 0600) in legacy api_key mode.
+Hooks send the key as the X-Anamnesis-Key header. Run 'anamnesis-config'
+without --api-key to switch to OAuth, which stores no api_key.
 
 Your memory is visible, searchable, and deletable at:
     $SERVER/memory
@@ -129,7 +146,7 @@ fi
 if ! command -v python3 >/dev/null 2>&1; then
     echo "anamnesis-config: python3 required for the OAuth flow (not found in PATH)." >&2
     echo "  install via:  brew install python   (macOS)  or  apt-get install python3" >&2
-    echo "  or use legacy mode:  anamnesis-config --api-key anm_... --handle $HANDLE" >&2
+    echo "  or use legacy mode:  anamnesis-config --api-key - --handle $HANDLE < keyfile" >&2
     exit 2
 fi
 
@@ -153,8 +170,8 @@ echo
 # Writing to a tempfile instead of $(python3 <<PY) because macOS ships
 # bash 3.2 (2007), whose parser mis-tokenizes quoted heredoc bodies
 # containing embedded quotes when wrapped in command substitution.
-OAUTH_TMP="$(mktemp 2>/dev/null || printf '/tmp/anamnesis_oauth_%s' $$)"
-trap "rm -f '$OAUTH_TMP'" EXIT
+OAUTH_TMP="$(mktemp "${TMPDIR:-/tmp}/anamnesis-oauth.XXXXXX")"
+trap 'rm -f "$OAUTH_TMP"' EXIT
 SERVER="$SERVER" SCOPES="$SCOPES" python3 > "$OAUTH_TMP" <<'PY'
 import base64, hashlib, http.server, json, os, secrets, socket
 import sys, threading, urllib.parse, urllib.request, urllib.error, webbrowser
@@ -291,53 +308,22 @@ print(json.dumps({
     "client_id":     client_id,
 }))
 PY
-OAUTH_RESULT="$(cat "$OAUTH_TMP" 2>/dev/null || true)"
-
-if [ -z "$OAUTH_RESULT" ]; then
+if ! jq -e '.access_token | type == "string" and length > 0' < "$OAUTH_TMP" >/dev/null 2>&1; then
     echo "anamnesis-config: OAuth flow did not complete." >&2
     exit 1
 fi
 
-ACCESS_TOKEN="$(printf '%s' "$OAUTH_RESULT"  | jq -r '.access_token')"
-REFRESH_TOKEN="$(printf '%s' "$OAUTH_RESULT" | jq -r '.refresh_token')"
-EXPIRES_IN="$(printf '%s' "$OAUTH_RESULT"    | jq -r '.expires_in')"
-GRANTED_SCOPE="$(printf '%s' "$OAUTH_RESULT" | jq -r '.scope')"
-CLIENT_ID="$(printf '%s' "$OAUTH_RESULT"     | jq -r '.client_id')"
-
-# --- write config ---
-mkdir -p "$ANAMNESIS_HOME"
-chmod 700 "$ANAMNESIS_HOME"
-
+# Tokens go from the OAuth result file straight into the config, never
+# through a command line.
 TS_NOW="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-# Compute expires_at as absolute epoch seconds so refresh logic can check
-# it trivially without timezone math. 60s safety margin baked into the
-# refresh predicate, not here.
-EXPIRES_AT="$(date -u -v+"${EXPIRES_IN}"S +"%s" 2>/dev/null \
-           || date -u -d "+${EXPIRES_IN} seconds" +"%s" 2>/dev/null \
-           || echo 0)"
-
-jq -n \
-    --arg handle         "$HANDLE" \
-    --arg server         "$SERVER" \
-    --arg access_token   "$ACCESS_TOKEN" \
-    --arg refresh_token  "$REFRESH_TOKEN" \
-    --argjson expires_at "${EXPIRES_AT:-0}" \
-    --arg scope          "$GRANTED_SCOPE" \
-    --arg client_id      "$CLIENT_ID" \
-    --arg ts             "$TS_NOW" \
-    '{
-        handle:        $handle,
-        server_url:    $server,
-        access_token:  $access_token,
-        refresh_token: $refresh_token,
-        expires_at:    $expires_at,
-        scope:         $scope,
-        client_id:     $client_id,
-        created_at:    $ts,
-        auth_mode:     "oauth"
-    }' \
-    > "$ANAMNESIS_CONFIG"
-chmod 600 "$ANAMNESIS_CONFIG"
+jq --arg handle "$HANDLE" --arg server "$SERVER" --arg ts "$TS_NOW" '
+    {handle: $handle, server_url: $server,
+     access_token: .access_token, refresh_token: .refresh_token,
+     expires_at: ((now | floor) + (.expires_in // 3600 | tonumber? // 3600 | floor)),
+     scope: .scope, client_id: .client_id, created_at: $ts, auth_mode: "oauth"}' < "$OAUTH_TMP" \
+    | write_config '["api_key"]'
+GRANTED_SCOPE="$(jq -r '.scope' < "$OAUTH_TMP")"
+EXPIRES_IN="$(jq -r '.expires_in' < "$OAUTH_TMP")"
 
 cat <<EOM
 
@@ -345,9 +331,8 @@ Anamnesis config written to $ANAMNESIS_CONFIG (mode 0600).
 Auth mode: OAuth 2.1 + PKCE. Scopes granted: $GRANTED_SCOPE.
 Access token expires in ${EXPIRES_IN}s; refresh token rotates automatically on every use.
 
-Hooks fire deterministically on SessionStart, every prompt, every turn,
-and SessionEnd. Run 'anamnesis pause' to suspend capture; delete
-$ANAMNESIS_HOME/paused to resume.
+Hooks fire on session start, every prompt and every turn. Run
+'anamnesis pause' to suspend capture and 'anamnesis resume' to resume.
 
 Your memory is visible, searchable, and deletable at:
     $SERVER/memory

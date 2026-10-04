@@ -3,6 +3,7 @@
 # Concrete control surface (ADR-062 §12.2 — one of the six defensible axes).
 
 set -eu
+umask 077
 
 ANAMNESIS_HOME="${ANAMNESIS_HOME:-$HOME/.anamnesis}"
 PAUSE_FILE="$ANAMNESIS_HOME/paused"
@@ -13,23 +14,26 @@ SUB="${1:-status}"
 case "$SUB" in
     pause)
         mkdir -p "$ANAMNESIS_HOME"
+        # A second pause keeps the first timestamp, so the recorded gap
+        # covers the whole blackout.
+        if [ -f "$PAUSE_FILE" ]; then
+            echo "anamnesis: already paused since $(cat "$PAUSE_FILE")."
+            exit 0
+        fi
         date -u +"%Y-%m-%dT%H:%M:%SZ" > "$PAUSE_FILE"
-        chmod 600 "$PAUSE_FILE" 2>/dev/null || true
-        echo "anamnesis: paused. Hooks will silently exit 0 until you resume."
-        echo "           'anamnesis resume' to re-enable."
+        echo "anamnesis: paused. Hooks capture and recall nothing, and the Codex MCP proxy"
+        echo "           goes offline, until 'anamnesis resume'. A remote MCP connection the"
+        echo "           host CLI makes itself (Claude Code, Gemini CLI) is not paused."
         ;;
     resume)
         if [ -f "$PAUSE_FILE" ]; then
             PAUSED_AT="$(cat "$PAUSE_FILE" 2>/dev/null || true)"
             [ -n "$PAUSED_AT" ] || PAUSED_AT="unknown"
             RESUMED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-            # Record the blackout window (capture-gap lesson, 2026-08-09: a
-            # pause during incident response silently lost the most
-            # decision-dense sessions). The next SessionStart surfaces this
-            # once so the assistant can offer a backfill.
+            # The next SessionStart names this window once, so the assistant
+            # can offer to backfill decisions made while nothing was captured.
             printf '{"paused_at":"%s","resumed_at":"%s","surfaced":false}\n' \
                 "$PAUSED_AT" "$RESUMED_AT" > "$ANAMNESIS_HOME/last_gap.json"
-            chmod 600 "$ANAMNESIS_HOME/last_gap.json" 2>/dev/null || true
             rm -f "$PAUSE_FILE"
             echo "anamnesis: resumed."
             echo "  capture was OFF from $PAUSED_AT to $RESUMED_AT."
@@ -58,14 +62,14 @@ case "$SUB" in
             echo "  handle:     $(jq -r '.handle' < "$CONFIG" 2>/dev/null)"
             echo "  server:     $(jq -r '.server_url' < "$CONFIG" 2>/dev/null)"
             echo "  configured: $(jq -r '.created_at' < "$CONFIG" 2>/dev/null)"
+            echo "  visit:      $(jq -r '.server_url' < "$CONFIG" 2>/dev/null)/memory"
         fi
-        echo "  visit:      $(jq -r '.server_url' < "$CONFIG" 2>/dev/null)/memory"
         ;;
     help|--help|-h)
         cat <<USAGE
 anamnesis — memory control surface
 
-  anamnesis pause    suspend capture (hooks become no-ops)
+  anamnesis pause    suspend hook capture and recall (and the Codex MCP proxy)
   anamnesis resume   re-enable capture
   anamnesis status   show config + pause state (default)
 
