@@ -19,6 +19,9 @@
 #   anamnesis-config --allow-delete                    (also request memory.delete scope)
 #   anamnesis-config --api-key - --handle jia < key    (scripted, legacy)
 #   anamnesis-config --server https://alt.example.com  (self-host)
+#   anamnesis-config --adopt-queue                     (upload captures queued
+#                                                       under the previous
+#                                                       sign-in with this one)
 
 set -eu
 umask 077
@@ -32,6 +35,7 @@ API_KEY=""
 HANDLE=""
 SERVER="$DEFAULT_SERVER"
 ALLOW_DELETE="0"
+ADOPT_QUEUE="0"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,6 +43,7 @@ while [ $# -gt 0 ]; do
         --handle)        HANDLE="$2"; shift 2 ;;
         --server)        SERVER="$2"; shift 2 ;;
         --allow-delete)  ALLOW_DELETE="1"; shift ;;
+        --adopt-queue)   ADOPT_QUEUE="1"; shift ;;
         --help|-h)
             sed -n '2,23p' "$0" | sed 's/^# //; s/^#//'
             exit 0 ;;
@@ -110,6 +115,49 @@ write_config() {
     anamnesis_lock_release "$lock" || true
 }
 
+# Captures queued under the previous sign-in belong to whoever owned it,
+# and only the user knows whether that was them. With a terminal they are
+# asked; without one, --adopt-queue says yes. Entries not adopted are set
+# aside by the next queue replay instead of being uploaded.
+adopt_queue() {
+    local mine f n=0 answer tmp lock="$ANAMNESIS_QUEUE_DIR/.drain.lck"
+    mine="$(anamnesis_signin_binding)" || return 0
+    for f in "$ANAMNESIS_QUEUE_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        [ "$(anamnesis_queue_entry_binding "$f")" = "$mine" ] || n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] || return 0
+    if [ "$ADOPT_QUEUE" != "1" ] && [ -t 0 ]; then
+        printf '%s captures are queued from the previous sign-in. Upload them with this one? They belong to whoever that sign-in was. [y/N] ' "$n"
+        read -r answer
+        case "$answer" in y|Y|yes|YES) ADOPT_QUEUE="1" ;; esac
+    fi
+    if [ "$ADOPT_QUEUE" != "1" ]; then
+        echo "$n queued captures from the previous sign-in will not be uploaded; the next queue"
+        echo "replay moves them to $ANAMNESIS_QUEUE_DIR/quarantine. Re-run with --adopt-queue"
+        echo "to upload them with this sign-in."
+        return 0
+    fi
+    if ! anamnesis_lock_acquire "$lock" 20; then
+        echo "A queue replay is running; re-run anamnesis-config --adopt-queue in a minute." >&2
+        return 0
+    fi
+    for f in "$ANAMNESIS_QUEUE_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        [ "$(anamnesis_queue_entry_binding "$f")" = "$mine" ] && continue
+        if tmp="$(mktemp "$ANAMNESIS_QUEUE_DIR/.incoming.XXXXXX")" \
+            && jq --arg server "${mine%%$'\037'*}" --arg cred "${mine#*$'\037'}" \
+                '.server_url = $server | .credential = $cred' < "$f" > "$tmp" \
+            && mv -f "$tmp" "$f"; then
+            continue
+        fi
+        rm -f "${tmp:-}"
+        echo "anamnesis-config: could not rebind ${f##*/}; it will be set aside." >&2
+    done
+    anamnesis_lock_release "$lock" || true
+    echo "$n queued captures will upload with this sign-in."
+}
+
 if [ -n "$API_KEY" ]; then
     echo "Validating against $SERVER …"
     PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/anamnesis-config.XXXXXX")"
@@ -137,6 +185,7 @@ if [ -n "$API_KEY" ]; then
     ANAMNESIS_NEW_KEY="$API_KEY" jq -n --arg handle "$HANDLE" --arg server "$SERVER" --arg ts "$TS" \
         '{api_key: env.ANAMNESIS_NEW_KEY, handle: $handle, server_url: $server, created_at: $ts, auth_mode: "legacy"}' \
         | write_config '["access_token", "refresh_token", "expires_at", "client_id", "scope"]'
+    adopt_queue
 
     cat <<EOM
 
@@ -335,6 +384,7 @@ jq --arg handle "$HANDLE" --arg server "$SERVER" --arg ts "$TS_NOW" '
      expires_at: ((now | floor) + (.expires_in // 3600 | tonumber? // 3600 | floor)),
      scope: .scope, client_id: .client_id, created_at: $ts, auth_mode: "oauth"}' < "$OAUTH_TMP" \
     | write_config '["api_key"]'
+adopt_queue
 GRANTED_SCOPE="$(jq -r '.scope' < "$OAUTH_TMP")"
 EXPIRES_IN="$(jq -r '.expires_in' < "$OAUTH_TMP")"
 

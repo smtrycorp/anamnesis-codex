@@ -177,14 +177,18 @@ anamnesis_refresh_locked() {
 
 # Usage: anamnesis_request <GET|POST> <path> [json-body]
 # Prints the response body and also leaves it in ANAMNESIS_RESPONSE, with
-# the server's Date header in ANAMNESIS_SERVER_TIME; call it in the current
-# shell, not in $(...), when the caller needs those. Returns 0 on 2xx, 2 when
-# the server rejects our credentials, 1 otherwise. Credentials go to curl
-# through a 0600 header file and the body through stdin, never as arguments.
+# the server's Date header in ANAMNESIS_SERVER_TIME and the HTTP status in
+# ANAMNESIS_STATUS; call it in the current shell, not in $(...), when the
+# caller needs those. Returns 0 on 2xx, 2 when the server rejects our
+# credentials, 3 when a 2xx body reports {"status": "error"} (session_close
+# answers that way when reflection fails), 1 otherwise. Credentials go to
+# curl through a 0600 header file and the body through stdin, never as
+# arguments.
 anamnesis_request() {
     local method="$1" path="$2" body="${3:-}" dir status
     ANAMNESIS_RESPONSE=""
     ANAMNESIS_SERVER_TIME=""
+    ANAMNESIS_STATUS=""
     anamnesis_capture_enabled || return 1
     # Without a fresh token the request would only come back 401; the
     # caller queues or skips instead.
@@ -213,10 +217,15 @@ anamnesis_request() {
     [ -r "$dir/body" ] && ANAMNESIS_RESPONSE="$(cat "$dir/body")"
     [ -r "$dir/headers" ] && ANAMNESIS_SERVER_TIME="$(sed -n 's/^[Dd]ate:[[:space:]]*//p' "$dir/headers" | head -1 | tr -d '\r')"
     rm -rf "$dir"
+    ANAMNESIS_STATUS="$status"
     printf '%s' "$ANAMNESIS_RESPONSE"
     case "$status" in
         2*)
             [ -e "$ANAMNESIS_AUTH_FAILED_FILE" ] && rm -f "$ANAMNESIS_AUTH_FAILED_FILE"
+            if printf '%s' "$ANAMNESIS_RESPONSE" | jq -e 'type == "object" and .status == "error"' >/dev/null 2>&1; then
+                anamnesis_log_error "server_reported_error" "HTTP $status on $path: $(printf '%s' "$ANAMNESIS_RESPONSE" | jq -r '(.message // .error // "") | tostring | .[0:200]' 2>/dev/null)"
+                return 3
+            fi
             return 0 ;;
         401|403)
             anamnesis_log_error "auth_rejected" "HTTP $status on $path"
@@ -371,13 +380,44 @@ anamnesis_lock_release() {
     return 0
 }
 
+# The sign-in config.json belongs to, as "server<US>credential". The
+# credential is the OAuth client_id (the server binds every token it issues
+# to one, and each sign-in registers its own) or a digest of the legacy
+# api_key; the server exposes no account identity to clients, so this is
+# the closest binding the server itself verifies. Returns 1 with no output
+# when the config holds no credential.
+anamnesis_signin_binding() {
+    local server kind value
+    IFS=$'\037' read -r server kind value < <(jq -r '
+        [(.server_url // "https://anamnesis.smtry.ai"),
+         (if (.access_token // "") != "" and (.refresh_token // "") != "" then ["oauth", (.client_id // "")]
+          else ["key", (.api_key // "")] end)[]]
+        | join("\u001f")' < "$ANAMNESIS_CONFIG" 2>/dev/null)
+    [ -n "${value:-}" ] || return 1
+    case "$kind" in
+        oauth) printf '%s\037oauth:%s' "$server" "$value" ;;
+        key) printf '%s\037key:%s' "$server" "$(printf '%s' "$value" | anamnesis_digest)" ;;
+    esac
+}
+
+anamnesis_queue_entry_binding() {
+    jq -r '[(.server_url // ""), (.credential // "")] | join("\u001f")' < "$1" 2>/dev/null
+}
+
 # Usage: anamnesis_drain_queue [max-files]
-# Replays queued payloads oldest first. Stops at the first failed send (the
-# rest would fail the same way, only slower) and does nothing while another
-# drain holds the queue lock. Run it in the background: it does network work.
+# Replays queued payloads oldest first. A payload queued under another
+# sign-in or server, or one the server refuses for good, is set aside in
+# pending_uploads/quarantine so the rest can drain; the drain stops at a
+# server or sign-in failure (the rest would fail the same way) and does
+# nothing while another drain holds the queue lock. Run it in the
+# background: it does network work.
 anamnesis_drain_queue() {
-    local max="${1:-20}" lock="$ANAMNESIS_QUEUE_DIR/.drain.lck" sent=0 f path body
+    local max="${1:-20}" lock="$ANAMNESIS_QUEUE_DIR/.drain.lck" sent=0 f path body mine
     anamnesis_lock_acquire "$lock" 0 || return 0
+    if ! mine="$(anamnesis_signin_binding)"; then
+        anamnesis_lock_release "$lock"
+        return 0
+    fi
     for f in "$ANAMNESIS_QUEUE_DIR"/*.json; do
         [ -e "$f" ] || continue
         [ "$sent" -ge "$max" ] && break
@@ -393,22 +433,63 @@ anamnesis_drain_queue() {
             rm -f "$f"
             continue
         fi
-        anamnesis_post "$path" "$body" >/dev/null || break
-        rm -f "$f"
-        sent=$((sent + 1))
+        # Whoever owns the current sign-in must not receive what another
+        # sign-in's owner said; an entry without a binding cannot be told
+        # apart from one.
+        if [ "$(anamnesis_queue_entry_binding "$f")" != "$mine" ]; then
+            anamnesis_queue_quarantine "$f" "queued under another sign-in or server"
+            continue
+        fi
+        if anamnesis_post "$path" "$body" >/dev/null; then
+            rm -f "$f"
+            sent=$((sent + 1))
+            continue
+        fi
+        case "$ANAMNESIS_STATUS" in
+            # The server took the request and refused it, or the request
+            # itself is wrong: a retry cannot help, and one bad payload must
+            # not hold the queue.
+            2*|400|404|405|413|415|422)
+                anamnesis_queue_quarantine "$f" "the server refused it (HTTP $ANAMNESIS_STATUS)" ;;
+            *) break ;;
+        esac
     done
     anamnesis_lock_release "$lock"
     [ "$sent" -gt 0 ] && anamnesis_log_error "queue_drained" "$sent payloads replayed"
     return 0
 }
 
+# Moves a queued payload to pending_uploads/quarantine with the reason: the
+# user may still want it, so it is never deleted, and the replay goes on
+# past it. A payload that cannot even be moved stays where it is and the
+# next drain tries again.
+anamnesis_queue_quarantine() {
+    local f="$1" why="$2" dir="$ANAMNESIS_QUEUE_DIR/quarantine" tmp
+    mkdir -p "$dir" 2>/dev/null
+    if tmp="$(mktemp "$dir/.incoming.XXXXXX")" \
+        && jq --arg why "$why" '. + {quarantined_at: (now | todate), reason: $why}' < "$f" > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$dir/${f##*/}"; then
+        rm -f "$f"
+        anamnesis_log_error "queue_quarantined" "${f##*/}: $why; kept in $dir"
+        return 0
+    fi
+    [ -n "${tmp:-}" ] && rm -f "$tmp"
+    anamnesis_log_error "queue_quarantine_failed" "${f##*/}: $why; could not move it to $dir"
+    return 1
+}
+
 # Writes under a dot-name and renames into place, so a concurrent drain never
-# reads a half-written payload.
+# reads a half-written payload. The entry names the sign-in it was captured
+# under; a replay under another one sets it aside instead of sending it.
 anamnesis_queue_payload() {
-    local path="$1" body="$2" tmp
+    local path="$1" body="$2" tmp binding
+    if ! binding="$(anamnesis_signin_binding)"; then
+        anamnesis_log_error "queue_write_failed" "$path: config.json holds no credential to bind the payload to"
+        return 1
+    fi
     if tmp="$(mktemp "$ANAMNESIS_QUEUE_DIR/.incoming.XXXXXX")" \
-        && printf '%s' "$body" | jq -c --arg path "$path" \
-            '{path: $path, body: ., queued_at: (now | todate)}' > "$tmp" 2>/dev/null \
+        && printf '%s' "$body" | jq -c --arg path "$path" --arg server "${binding%%$'\037'*}" --arg cred "${binding#*$'\037'}" \
+            '{path: $path, body: ., queued_at: (now | todate), server_url: $server, credential: $cred}' > "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$ANAMNESIS_QUEUE_DIR/$(date +%s)_$$_$RANDOM.json"; then
         return 0
     fi
