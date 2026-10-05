@@ -3,8 +3,9 @@
 # every Anamnesis hook. The Claude Code, Codex and Gemini CLI clients ship
 # byte-identical copies of this file; change all three. What a client's own
 # transcript looks like stays in that client's hooks.
-# Hooks always exit 0: a failure is logged to hook_errors.log (and, for a
-# rejected sign-in, shown to the user once) but never blocks the host CLI.
+# Hooks always exit 0: a failure is logged to hook_errors.log (and a failed
+# recall or rejected sign-in is shown to the user, once per cause) but never
+# blocks the host CLI.
 # shellcheck disable=SC2034  # globals set here are read by the sourcing hooks
 
 set -u
@@ -29,12 +30,53 @@ ANAMNESIS_CURL_TIMEOUT="${ANAMNESIS_CURL_TIMEOUT:-8}"
 ANAMNESIS_CONNECT_TIMEOUT="${ANAMNESIS_CONNECT_TIMEOUT:-3}"
 # Half-second ticks to wait for another process's token refresh.
 ANAMNESIS_REFRESH_WAIT="${ANAMNESIS_REFRESH_WAIT:-20}"
+# Seconds one anamnesis_request may take in all, refresh and retry
+# included. A foreground hook sets it; empty means one attempt capped by
+# ANAMNESIS_CURL_TIMEOUT and no retry, which is what background uploads want.
+ANAMNESIS_DEADLINE="${ANAMNESIS_DEADLINE:-}"
 ANAMNESIS_SID=""
 ANAMNESIS_RESPONSE=""
 ANAMNESIS_SERVER_TIME=""
+# What the last anamnesis_request did, for the failure log and receipt:
+# the HTTP status (000 when curl never got one), curl's exit code, seconds
+# spent, attempts made, the stage that failed (capture_off, token_refresh,
+# request, response_parse), the class of the failure (timeout, connect,
+# server, auth, parse, busy, local) and a note such as the OAuth error code.
+ANAMNESIS_STATUS=""
+ANAMNESIS_CURL_EXIT=""
+ANAMNESIS_SPENT=0
+ANAMNESIS_ATTEMPTS=0
+ANAMNESIS_FAIL_STAGE=""
+ANAMNESIS_FAIL_CLASS=""
+ANAMNESIS_FAIL_NOTE=""
 ANAMNESIS_AUTH_WARNING="[anamnesis] the server rejected your sign-in, so recall is off and captures are queued on this machine. Run anamnesis-config to sign in again."
 
 mkdir -p "$ANAMNESIS_QUEUE_DIR" "$ANAMNESIS_STATE_DIR" "$ANAMNESIS_RECEIPT_DIR" 2>/dev/null
+
+# Prints "<client>/<version>" for the X-Anamnesis-Client header on every
+# request, so the server can say which client and version a user runs. The
+# version is read from the manifest beside the hooks directory, where it is
+# written once; which manifest exists says which client this copy ships in.
+anamnesis_client_tag() {
+    local root client manifest version
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+    if [ -r "$root/.claude-plugin/plugin.json" ]; then
+        client="claude-code" manifest="$root/.claude-plugin/plugin.json"
+    elif [ -r "$root/.codex-plugin/plugin.json" ]; then
+        client="codex" manifest="$root/.codex-plugin/plugin.json"
+    elif [ -r "$root/gemini-extension.json" ]; then
+        client="gemini-cli" manifest="$root/gemini-extension.json"
+    else
+        printf 'unknown/0'
+        return 0
+    fi
+    version="$(jq -r '.version // empty | strings' < "$manifest" 2>/dev/null)"
+    case "$version" in
+        ''|*[!0-9A-Za-z._-]*) version="0" ;;
+    esac
+    printf '%s/%s' "$client" "$version"
+}
+ANAMNESIS_CLIENT="$(anamnesis_client_tag)"
 
 anamnesis_log_error() {
     local detail
@@ -104,12 +146,16 @@ anamnesis_token_fresh() {
 anamnesis_ensure_token() {
     [ "${ANAMNESIS_AUTH_MODE:-}" = "oauth" ] || return 0
     anamnesis_token_fresh && return 0
-    local lock="$ANAMNESIS_HOME/refresh.lck" rc=0
-    if ! anamnesis_lock_acquire "$lock" "$ANAMNESIS_REFRESH_WAIT"; then
-        anamnesis_log_error "refresh_skipped" "another process holds $lock"
+    local lock="$ANAMNESIS_HOME/refresh.lck" rc=0 taken=0
+    anamnesis_lock_acquire "$lock" "$ANAMNESIS_REFRESH_WAIT" || taken=1
+    anamnesis_spend "$(awk -v t="$ANAMNESIS_LOCK_WAITED" 'BEGIN { printf "%.1f", t / 2 }')"
+    if [ "$taken" -ne 0 ]; then
+        ANAMNESIS_FAIL_CLASS="busy"
+        anamnesis_log_error "refresh_skipped" "another process held $lock for the $ANAMNESIS_SPENT s wait"
         return 1
     fi
     if ! anamnesis_load_config; then
+        ANAMNESIS_FAIL_CLASS="local"
         rc=1
     elif [ "$ANAMNESIS_AUTH_MODE" = "oauth" ] && ! anamnesis_token_fresh; then
         anamnesis_refresh_locked || rc=1
@@ -121,26 +167,44 @@ anamnesis_ensure_token() {
 # Caller holds refresh.lck. The refresh token travels in a 0600 file, never
 # on a command line where ps would show it.
 anamnesis_refresh_locked() {
-    local dir status tmp
+    local dir tmp max oauth_error
     if ! dir="$(mktemp -d "${TMPDIR:-/tmp}/anamnesis.XXXXXX")"; then
+        ANAMNESIS_FAIL_CLASS="local"
         anamnesis_log_error "refresh_failed" "mktemp failed"
         return 1
     fi
     if ! cp "$ANAMNESIS_CONFIG" "$dir/before" 2>/dev/null \
         || ! jq -j '"grant_type=refresh_token&refresh_token=\(.refresh_token | @uri)&client_id=\(.client_id // "" | @uri)"' \
             < "$dir/before" > "$dir/form" 2>/dev/null; then
+        ANAMNESIS_FAIL_CLASS="local"
         anamnesis_log_error "refresh_failed" "could not build the refresh request from $ANAMNESIS_CONFIG"
         rm -rf "$dir"
         return 1
     fi
-    status="$(curl -sS -X POST "${ANAMNESIS_SERVER_URL}/oauth/token" \
-        --connect-timeout "$ANAMNESIS_CONNECT_TIMEOUT" --max-time "$ANAMNESIS_CURL_TIMEOUT" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        --data-binary @"$dir/form" -o "$dir/resp" -w '%{http_code}' 2>/dev/null)" || status="000"
+    max="$(anamnesis_budget_left)"
+    if [ "$max" = 0 ]; then
+        ANAMNESIS_FAIL_CLASS="timeout"
+        rm -rf "$dir"
+        return 1
+    fi
+    anamnesis_curl "$max" -X POST "${ANAMNESIS_SERVER_URL}/oauth/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" -H "X-Anamnesis-Client: $ANAMNESIS_CLIENT" \
+        --data-binary @"$dir/form" -o "$dir/resp"
     if ! jq -e '.access_token | type == "string" and length > 0' < "$dir/resp" >/dev/null 2>&1; then
         # Only the status and the OAuth error fields: the body of an odd
         # success could hold a live token.
-        anamnesis_log_error "refresh_failed" "HTTP $status $(jq -r '[.error, .error_description] | map(strings) | join(": ")' < "$dir/resp" 2>/dev/null)"
+        oauth_error="$(jq -r '[.error, .error_description] | map(strings) | join(": ")' < "$dir/resp" 2>/dev/null)"
+        ANAMNESIS_FAIL_NOTE="${oauth_error%%:*}"
+        anamnesis_classify_failure
+        # invalid_grant is the server saying this refresh token is dead for
+        # good (revoked, rotated past, or the sign-in was deleted). Every
+        # request from now on would fail the same way, so the sign-in
+        # warning is due now, with no request made.
+        if [ "$ANAMNESIS_FAIL_NOTE" = "invalid_grant" ]; then
+            ANAMNESIS_FAIL_CLASS="auth"
+            : > "$ANAMNESIS_AUTH_FAILED_FILE"
+        fi
+        anamnesis_log_error "refresh_failed" "curl exit $ANAMNESIS_CURL_EXIT, HTTP $ANAMNESIS_STATUS${oauth_error:+ $oauth_error}, $ANAMNESIS_SPENT s against the $max s limit"
         rm -rf "$dir"
         return 1
     fi
@@ -171,8 +235,128 @@ anamnesis_refresh_locked() {
     [ -n "${tmp:-}" ] && rm -f "$tmp"
     # The server has already retired the old refresh token, so losing the
     # new pair here means signing in again.
+    ANAMNESIS_FAIL_CLASS="local"
     anamnesis_log_error "token_persist_failed" "could not write the new tokens to $ANAMNESIS_CONFIG; run anamnesis-config"
     return 1
+}
+
+# Adds seconds to ANAMNESIS_SPENT. awk, because bash has no fractions and
+# curl reports its times in them.
+anamnesis_spend() {
+    case "$1" in
+        ''|*[!0-9.]*) return 0 ;;
+    esac
+    ANAMNESIS_SPENT="$(awk -v a="$ANAMNESIS_SPENT" -v b="$1" 'BEGIN { printf "%.2f", a + b }')"
+}
+
+# Prints --max-time for the next curl: the per-request cap, or what is left
+# of ANAMNESIS_DEADLINE when one is set, whichever is smaller. Prints 0 when
+# less than half a second is left, and the caller must then not call curl:
+# curl reads --max-time 0 as no limit at all.
+anamnesis_budget_left() {
+    case "${ANAMNESIS_DEADLINE:-}" in
+        ''|*[!0-9.]*) printf '%s' "$ANAMNESIS_CURL_TIMEOUT"; return 0 ;;
+    esac
+    awk -v d="$ANAMNESIS_DEADLINE" -v s="$ANAMNESIS_SPENT" -v c="$ANAMNESIS_CURL_TIMEOUT" \
+        'BEGIN { r = d - s; if (r > c) r = c; if (r < 0.5) print 0; else printf "%.1f", r }'
+}
+
+# Usage: anamnesis_curl <max-time> <curl args...>
+# One curl call with the shared connect timeout; sets ANAMNESIS_STATUS and
+# ANAMNESIS_CURL_EXIT, adds the time it took to ANAMNESIS_SPENT and counts
+# it in ANAMNESIS_ATTEMPTS. A call that failed before timing anything is
+# charged its whole limit, so a stuck attempt can never look free.
+anamnesis_curl() {
+    local max="$1" report took
+    shift
+    ANAMNESIS_ATTEMPTS=$((ANAMNESIS_ATTEMPTS + 1))
+    report="$(curl -sS --connect-timeout "$ANAMNESIS_CONNECT_TIMEOUT" --max-time "$max" \
+        -w '%{http_code} %{time_total}' "$@" 2>/dev/null)"
+    ANAMNESIS_CURL_EXIT=$?
+    ANAMNESIS_STATUS="${report%% *}"
+    took="${report#* }"
+    case "$ANAMNESIS_STATUS" in
+        [0-9][0-9][0-9]) ;;
+        *) ANAMNESIS_STATUS="000" ;;
+    esac
+    case "$took" in
+        ''|*[!0-9.]*|"$report") took="$max" ;;
+    esac
+    anamnesis_spend "$took"
+}
+
+# Sets ANAMNESIS_FAIL_CLASS from the last curl: curl exit 28 is a timeout,
+# any other curl exit a connection that never carried a reply, 401 and 403
+# the server rejecting the sign-in, any other status a server answer.
+anamnesis_classify_failure() {
+    case "$ANAMNESIS_CURL_EXIT:$ANAMNESIS_STATUS" in
+        28:*) ANAMNESIS_FAIL_CLASS="timeout" ;;
+        0:401|0:403) ANAMNESIS_FAIL_CLASS="auth" ;;
+        0:*) ANAMNESIS_FAIL_CLASS="server" ;;
+        *) ANAMNESIS_FAIL_CLASS="connect" ;;
+    esac
+}
+
+# Whether the last curl is worth one more try: the server was not reached
+# or did not finish (curl 28 timeout, 7 refused, 52 empty reply, 56 cut
+# off) or it said so itself (502, 503, 504). A 4xx is the request's fault
+# and comes back the same.
+anamnesis_attempt_retryable() {
+    case "$ANAMNESIS_CURL_EXIT" in
+        28|7|52|56) return 0 ;;
+        0) ;;
+        *) return 1 ;;
+    esac
+    case "$ANAMNESIS_STATUS" in
+        502|503|504) return 0 ;;
+    esac
+    return 1
+}
+
+# Prints the seconds a Retry-After header asks for, 0 when there is none.
+# Returns 1 for a header it cannot read (the HTTP-date form, or junk): an
+# unknown wait is not a wait of zero.
+anamnesis_retry_after() {
+    local wait
+    wait="$(sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*//p' "$1" 2>/dev/null | head -1 | tr -d '\r[:space:]')"
+    case "$wait" in
+        '') printf 0 ;;
+        *[!0-9]*) return 1 ;;
+        *) printf '%s' "$wait" ;;
+    esac
+}
+
+# Usage: anamnesis_retry_due <headers-file>
+# After an attempt: whether to make one more, after ANAMNESIS_RETRY_WAIT
+# seconds. Only under a deadline, only after the first attempt, only for a
+# failure a retry can mend, and only when the Retry-After the server asked
+# for (kept for the log either way) can be read and leaves two seconds of
+# budget once waited out.
+anamnesis_retry_due() {
+    local wait
+    ANAMNESIS_RETRY_WAIT=0
+    if ! wait="$(anamnesis_retry_after "$1")"; then
+        ANAMNESIS_FAIL_NOTE="Retry-After not understood"
+        return 1
+    fi
+    [ "$wait" -gt 0 ] && ANAMNESIS_FAIL_NOTE="Retry-After $wait s"
+    [ -n "${ANAMNESIS_DEADLINE:-}" ] && [ "$ANAMNESIS_ATTEMPTS" -eq 1 ] && anamnesis_attempt_retryable || return 1
+    awk -v d="$ANAMNESIS_DEADLINE" -v s="$ANAMNESIS_SPENT" -v w="$wait" 'BEGIN { exit !(d - s - w >= 2) }' || return 1
+    ANAMNESIS_RETRY_WAIT="$wait"
+}
+
+# One line about the last failed anamnesis_request, for hook_errors.log.
+# Numbers only: no token, prompt or body can get into the log this way.
+anamnesis_failure_detail() {
+    local limit="${ANAMNESIS_DEADLINE:-}" attempts="$ANAMNESIS_ATTEMPTS attempts"
+    case "$limit" in
+        ''|*[!0-9.]*) limit="the $ANAMNESIS_CURL_TIMEOUT s per-request limit" ;;
+        *) limit="the $limit s deadline" ;;
+    esac
+    [ "$ANAMNESIS_ATTEMPTS" -eq 1 ] && attempts="1 attempt"
+    printf '%s: curl exit %s, HTTP %s, %s s against %s, %s%s' \
+        "${ANAMNESIS_FAIL_STAGE:-request}" "${ANAMNESIS_CURL_EXIT:-none}" "${ANAMNESIS_STATUS:-000}" \
+        "$ANAMNESIS_SPENT" "$limit" "$attempts" "${ANAMNESIS_FAIL_NOTE:+, $ANAMNESIS_FAIL_NOTE}"
 }
 
 # Usage: anamnesis_request <GET|POST> <path> [json-body]
@@ -181,21 +365,35 @@ anamnesis_refresh_locked() {
 # ANAMNESIS_STATUS; call it in the current shell, not in $(...), when the
 # caller needs those. Returns 0 on 2xx, 2 when the server rejects our
 # credentials, 3 when a 2xx body reports {"status": "error"} (session_close
-# answers that way when reflection fails), 1 otherwise. Credentials go to
-# curl through a 0600 header file and the body through stdin, never as
-# arguments.
+# answers that way when reflection fails), 1 otherwise, with the ANAMNESIS_
+# FAIL_* variables saying why. Under ANAMNESIS_DEADLINE, one attempt that
+# did not reach the server or found it down is tried once more if at least
+# two seconds are left after any Retry-After. Credentials and the body go
+# to curl through 0600 files, never as arguments.
 anamnesis_request() {
-    local method="$1" path="$2" body="${3:-}" dir status
+    local method="$1" path="$2" body="${3:-}" dir max
     ANAMNESIS_RESPONSE=""
     ANAMNESIS_SERVER_TIME=""
     ANAMNESIS_STATUS=""
-    anamnesis_capture_enabled || return 1
+    ANAMNESIS_CURL_EXIT=""
+    ANAMNESIS_SPENT=0
+    ANAMNESIS_ATTEMPTS=0
+    ANAMNESIS_FAIL_STAGE=""
+    ANAMNESIS_FAIL_CLASS=""
+    ANAMNESIS_FAIL_NOTE=""
+    if ! anamnesis_capture_enabled; then
+        ANAMNESIS_FAIL_STAGE="capture_off"
+        return 1
+    fi
     # Without a fresh token the request would only come back 401; the
     # caller queues or skips instead.
     if [ "${ANAMNESIS_AUTH_MODE:-}" = "oauth" ] && ! anamnesis_ensure_token; then
+        ANAMNESIS_FAIL_STAGE="token_refresh"
         return 1
     fi
+    ANAMNESIS_FAIL_STAGE="request"
     if ! dir="$(mktemp -d "${TMPDIR:-/tmp}/anamnesis.XXXXXX")"; then
+        ANAMNESIS_FAIL_CLASS="local"
         anamnesis_log_error "request_skipped" "mktemp failed for $path"
         return 1
     fi
@@ -204,34 +402,61 @@ anamnesis_request() {
     else
         printf 'X-Anamnesis-Key: %s\n' "${ANAMNESIS_API_KEY:-}" > "$dir/auth"
     fi
-    if [ "$method" = "POST" ]; then
-        status="$(printf '%s' "$body" | curl -sS -X POST "${ANAMNESIS_SERVER_URL}${path}" \
-            --connect-timeout "$ANAMNESIS_CONNECT_TIMEOUT" --max-time "$ANAMNESIS_CURL_TIMEOUT" \
-            -H @"$dir/auth" -H "Content-Type: application/json" \
-            -D "$dir/headers" -o "$dir/body" -w '%{http_code}' --data-binary @- 2>/dev/null)" || status="000"
-    else
-        status="$(curl -sS -X GET "${ANAMNESIS_SERVER_URL}${path}" \
-            --connect-timeout "$ANAMNESIS_CONNECT_TIMEOUT" --max-time "$ANAMNESIS_CURL_TIMEOUT" \
-            -H @"$dir/auth" -D "$dir/headers" -o "$dir/body" -w '%{http_code}' 2>/dev/null)" || status="000"
-    fi
+    printf 'X-Anamnesis-Client: %s\n' "$ANAMNESIS_CLIENT" >> "$dir/auth"
+    # The body is a 0600 file too, not a pipe: a pipeline would run the curl
+    # step in a subshell and lose what it records.
+    printf '%s' "$body" > "$dir/req"
+    # Attempts at this request only; a refresh's curl is not one of them.
+    ANAMNESIS_ATTEMPTS=0
+    while :; do
+        max="$(anamnesis_budget_left)"
+        if [ "$max" = 0 ]; then
+            # The refresh took the whole budget; nothing was sent.
+            ANAMNESIS_STATUS="000"
+            ANAMNESIS_FAIL_CLASS="timeout"
+            rm -rf "$dir"
+            return 1
+        fi
+        rm -f "$dir/headers" "$dir/body"
+        if [ "$method" = "POST" ]; then
+            anamnesis_curl "$max" -X POST "${ANAMNESIS_SERVER_URL}${path}" \
+                -H @"$dir/auth" -H "Content-Type: application/json" \
+                -D "$dir/headers" -o "$dir/body" --data-binary @"$dir/req"
+        else
+            anamnesis_curl "$max" -X GET "${ANAMNESIS_SERVER_URL}${path}" \
+                -H @"$dir/auth" -D "$dir/headers" -o "$dir/body"
+        fi
+        anamnesis_retry_due "$dir/headers" || break
+        sleep "$ANAMNESIS_RETRY_WAIT"
+        anamnesis_spend "$ANAMNESIS_RETRY_WAIT"
+    done
     [ -r "$dir/body" ] && ANAMNESIS_RESPONSE="$(cat "$dir/body")"
     [ -r "$dir/headers" ] && ANAMNESIS_SERVER_TIME="$(sed -n 's/^[Dd]ate:[[:space:]]*//p' "$dir/headers" | head -1 | tr -d '\r')"
     rm -rf "$dir"
-    ANAMNESIS_STATUS="$status"
     printf '%s' "$ANAMNESIS_RESPONSE"
-    case "$status" in
+    if [ "$ANAMNESIS_CURL_EXIT" -ne 0 ]; then
+        anamnesis_classify_failure
+        return 1
+    fi
+    case "$ANAMNESIS_STATUS" in
         2*)
             [ -e "$ANAMNESIS_AUTH_FAILED_FILE" ] && rm -f "$ANAMNESIS_AUTH_FAILED_FILE"
             if printf '%s' "$ANAMNESIS_RESPONSE" | jq -e 'type == "object" and .status == "error"' >/dev/null 2>&1; then
-                anamnesis_log_error "server_reported_error" "HTTP $status on $path: $(printf '%s' "$ANAMNESIS_RESPONSE" | jq -r '(.message // .error // "") | tostring | .[0:200]' 2>/dev/null)"
+                ANAMNESIS_FAIL_CLASS="server"
+                ANAMNESIS_FAIL_NOTE="the server reported an error"
+                anamnesis_log_error "server_reported_error" "HTTP $ANAMNESIS_STATUS on $path: $(printf '%s' "$ANAMNESIS_RESPONSE" | jq -r '(.message // .error // "") | tostring | .[0:200]' 2>/dev/null)"
                 return 3
             fi
+            ANAMNESIS_FAIL_STAGE=""
             return 0 ;;
         401|403)
-            anamnesis_log_error "auth_rejected" "HTTP $status on $path"
+            ANAMNESIS_FAIL_CLASS="auth"
+            anamnesis_log_error "auth_rejected" "HTTP $ANAMNESIS_STATUS on $path"
             : > "$ANAMNESIS_AUTH_FAILED_FILE"
             return 2 ;;
-        *) return 1 ;;
+        *)
+            ANAMNESIS_FAIL_CLASS="server"
+            return 1 ;;
     esac
 }
 
@@ -311,14 +536,15 @@ anamnesis_self_pid() {
 # descriptor, and the Codex MCP proxy takes refresh.lck from Python, so the
 # lock has to be a filesystem object both can take by the same rules.
 anamnesis_lock_acquire() {
-    local lock="$1" max="$2" waited=0
+    local lock="$1" max="$2"
+    ANAMNESIS_LOCK_WAITED=0
     anamnesis_self_pid || return 1
     while ! ln -sn "$ANAMNESIS_SELF_PID" "$lock" 2>/dev/null; do
         # A reclaim that succeeded removed a dead holder's link, so retrying
         # at once cannot loop unless a holder dies every time.
         anamnesis_lock_reclaim "$lock" && continue
-        waited=$((waited + 1))
-        [ "$waited" -gt "$max" ] && return 1
+        [ "$ANAMNESIS_LOCK_WAITED" -ge "$max" ] && return 1
+        ANAMNESIS_LOCK_WAITED=$((ANAMNESIS_LOCK_WAITED + 1))
         sleep 0.5
     done
     return 0
@@ -507,7 +733,8 @@ anamnesis_start_background_sync() {
     {
         anamnesis_drain_queue
         anamnesis_post "/mcp/tools/get_memory_stats" '{}' >/dev/null \
-            || anamnesis_log_error "session_start_health_probe_failed" "sid=$ANAMNESIS_SID"
+            || [ "$ANAMNESIS_FAIL_STAGE" = "capture_off" ] \
+            || anamnesis_log_error "session_start_health_probe_failed" "sid=$ANAMNESIS_SID; $(anamnesis_failure_detail)"
     } </dev/null >/dev/null 2>&1 &
 }
 
@@ -536,7 +763,10 @@ ANAMNESIS_JQ_DEFANG='def defang: gsub("<(?<t>\\s*/?\\s*anamnesis)"; "&lt;\(.t)";
 # Usage: anamnesis_prompt_hook <hook-event-name> <recall-receipt: yes|no>
 # The per-prompt hook shared by every client: retrieve memories for the
 # prompt in ANAMNESIS_STDIN, then print the hook output with the recalled
-# lines (if any) and a date/time anchor that goes out on every turn.
+# lines (if any) and a date/time anchor that goes out on every turn. A
+# recall that fails is logged with its cause and told to the user once
+# per cause (anamnesis_recall_notice); only the client's own success
+# receipts hang on the second argument.
 anamnesis_prompt_hook() {
     local event="$1" receipt="$2" query lines count status msg="" addl
     # The server takes a query of at most 4,000 characters; a longer prompt
@@ -554,6 +784,13 @@ anamnesis_prompt_hook() {
     status=$?
 
     lines="[]"
+    if [ "$status" -eq 0 ] && ! anamnesis_recall_shape_ok; then
+        # A 2xx that is not a recall answer is a failure, not an empty
+        # result; it was once taken for one and never logged.
+        status=1
+        ANAMNESIS_FAIL_STAGE="response_parse"
+        ANAMNESIS_FAIL_CLASS="parse"
+    fi
     if [ "$status" -eq 0 ]; then
         # Server headlines first (one line per hit, substance first); older
         # servers only send hit bodies.
@@ -563,17 +800,16 @@ anamnesis_prompt_hook() {
              end)
             | map(gsub("\n"; " ") | .[0:220] | defang) | .[0:5]' 2>/dev/null)" || lines="[]"
         [ -n "$lines" ] || lines="[]"
-    else
-        anamnesis_log_error "retrieve_failed" "status=$status"
     fi
     count="$(printf '%s' "$lines" | jq 'length' 2>/dev/null)"
     case "$count" in ''|*[!0-9]*) count=0 ;; esac
 
-    if anamnesis_auth_warning_due; then
-        msg="$ANAMNESIS_AUTH_WARNING"
-    elif [ "$receipt" = "yes" ] && [ "$count" -gt 0 ] \
-        && [ "$(anamnesis_receipts_level)" = "normal" ] && anamnesis_receipt_once "recall"; then
-        msg="[anamnesis] recalled $count $([ "$count" -eq 1 ] && echo memory || echo memories) for this prompt — context you didn't have to re-explain"
+    if [ "$status" -eq 0 ]; then
+        anamnesis_receipt_mark "recall_ok"
+        [ "$receipt" = "yes" ] && msg="$(anamnesis_recall_receipt "$count")"
+    elif [ "$ANAMNESIS_FAIL_STAGE" != "capture_off" ]; then
+        anamnesis_log_error "retrieve_failed" "$(anamnesis_failure_detail)"
+        msg="$(anamnesis_recall_notice)"
     fi
 
     # nature= frames recalled memories as data that passed the pipeline
@@ -590,6 +826,67 @@ anamnesis_prompt_hook() {
     printf '%s' "$addl" | jq -Rs --arg ev "$event" --arg msg "$msg" '
         {hookSpecificOutput: {hookEventName: $ev, additionalContext: .}}
         + (if $msg == "" then {} else {systemMessage: $msg} end)'
+}
+
+# True when ANAMNESIS_RESPONSE has the shape of a recall answer: an object
+# carrying headlines or results (engrams on older servers), empty or not.
+anamnesis_recall_shape_ok() {
+    printf '%s' "$ANAMNESIS_RESPONSE" | jq -e '
+        type == "object" and ([.headlines, .results, .engrams] | any(type == "array"))' >/dev/null 2>&1
+}
+
+# Usage: anamnesis_recall_receipt <count>
+# Prints the success receipt the level allows: at normal the count on every
+# prompt, and "no matching memories" on the first empty recall of the
+# session only (an empty pool would otherwise say so on every turn); at
+# minimal the count once per session; nothing at off.
+anamnesis_recall_receipt() {
+    local count="$1" level noun="memories"
+    level="$(anamnesis_receipts_level)"
+    [ "$count" -eq 1 ] && noun="memory"
+    if [ "$count" -eq 0 ]; then
+        [ "$level" = "normal" ] && anamnesis_receipt_once "recall_zero" && printf '[anamnesis] no matching memories'
+    elif [ "$level" = "normal" ] || { [ "$level" = "minimal" ] && anamnesis_receipt_once "recall"; }; then
+        printf '[anamnesis] %s %s' "$count" "$noun"
+    fi
+    return 0
+}
+
+# Prints the one-line notice for a failed recall when it is due: the first
+# failure of its class this session, or the first failure after a success.
+# The same failure turn after turn says nothing more; a receipts level does
+# not silence it, since a recall that fails quietly is the one thing the
+# user cannot tell from one that works.
+anamnesis_recall_notice() {
+    local class="${ANAMNESIS_FAIL_CLASS:-connect}" why due=1
+    if ! anamnesis_receipt_fired "fail.$class" || anamnesis_receipt_fired "recall_ok"; then
+        due=0
+    fi
+    anamnesis_receipt_mark "fail.$class"
+    rm -f "$(anamnesis_receipt_marker "recall_ok")"
+    [ "$due" -eq 0 ] || return 0
+    case "$class" in
+        timeout) why="timed out after $(anamnesis_failure_limit) s" ;;
+        connect) why="could not connect, curl exit ${ANAMNESIS_CURL_EXIT:-none}" ;;
+        server)
+            case "$ANAMNESIS_STATUS" in
+                2*) why="the server reported an error" ;;
+                *) why="server $ANAMNESIS_STATUS" ;;
+            esac ;;
+        auth) why='sign in again: `anamnesis-config`' ;;
+        parse) why="unexpected reply" ;;
+        busy) why="another process was refreshing the sign-in" ;;
+        *) why="local error, see hook_errors.log" ;;
+    esac
+    printf '[anamnesis] recall unavailable this turn (%s)' "$why"
+}
+
+# The seconds a recall had in all, for the timeout notice.
+anamnesis_failure_limit() {
+    case "${ANAMNESIS_DEADLINE:-}" in
+        ''|*[!0-9.]*) printf '%s' "$ANAMNESIS_CURL_TIMEOUT" ;;
+        *) printf '%s' "$ANAMNESIS_DEADLINE" ;;
+    esac
 }
 
 # Usage: anamnesis_delta_begin <transcript-path>
@@ -744,10 +1041,13 @@ anamnesis_receipt_marker() {
 
 # Returns 0 (and marks) the first time a class fires this session; 1 after.
 anamnesis_receipt_once() {
-    local marker
-    marker="$(anamnesis_receipt_marker "$1")"
-    [ -e "$marker" ] && return 1
-    : > "$marker" 2>/dev/null
+    anamnesis_receipt_fired "$1" && return 1
+    anamnesis_receipt_mark "$1"
+    return 0
+}
+
+anamnesis_receipt_mark() {
+    : > "$(anamnesis_receipt_marker "$1")" 2>/dev/null
     return 0
 }
 

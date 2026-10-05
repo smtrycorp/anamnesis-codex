@@ -5,7 +5,9 @@ Usage: mock_server.py <dir>. Listens on a free loopback port, writes it to
 Responses come from <dir>/routes.json, re-read per request:
 {"/path": {"status": 200, "body": {...}, "headers": {...}, "delay": 0}};
 unknown paths get 200 {"status": "ok"}; a route with "auth": "current"
-answers 401 unless the request carries the current access token. Unless
+answers 401 unless the request carries the current access token; a route
+with "then": {...} is served once and then replaced by its "then" route,
+so a test can script a sequence of answers. Unless
 routes.json names it, /oauth/token rotates: it accepts only the current
 refresh token (state in <dir>/oauth.json) and issues a new pair.
 """
@@ -39,11 +41,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(os.path.join(DIR, "requests"), "a") as f:
             f.write(json.dumps({"method": self.command, "path": self.path,
                                 "auth": self.headers.get("Authorization") or self.headers.get("X-Anamnesis-Key"),
+                                "client": self.headers.get("X-Anamnesis-Client"),
                                 "body": raw}) + "\n")
-        route = _routes().get(path)
+        routes = _routes()
+        route = routes.get(path)
         if path == "/oauth/token" and route is None:
             return self._token(raw)
         route = route or {}
+        if "then" in route:
+            routes[path] = route["then"]
+            with open(os.path.join(DIR, "routes.json"), "w") as f:
+                json.dump(routes, f)
         time.sleep(route.get("delay", 0))
         if route.get("auth") == "current" and self.headers.get("Authorization") != "Bearer " + self._state()["access_token"]:
             return self._send(401, {"error": "invalid_token"})

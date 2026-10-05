@@ -45,6 +45,22 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 # A token response or an error body is a few hundred bytes; anything near
 # this is not one.
 MAX_SMALL_BODY_BYTES = 64 * 1024
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def _client_tag() -> str:
+    """"codex-proxy/<version>" for the X-Anamnesis-Client header on every
+    request, so the server can say which client and version a user runs. The
+    version comes from the plugin manifest, where it is written once."""
+    try:
+        with open(os.path.join(PLUGIN_ROOT, ".codex-plugin", "plugin.json")) as f:
+            version = json.load(f).get("version")
+    except (OSError, ValueError, AttributeError):
+        version = None
+    return f"codex-proxy/{version if isinstance(version, str) and version else '0'}"
+
+
+CLIENT_TAG = _client_tag()
 
 
 class ProxyError(Exception):
@@ -269,7 +285,7 @@ def _refresh(stale_access: str) -> dict:
         req = urllib.request.Request(
             f"{server}/oauth/token",
             data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={"Content-Type": "application/x-www-form-urlencoded", "X-Anamnesis-Client": CLIENT_TAG},
         )
         try:
             with _OPENER.open(req, timeout=TIMEOUT_S) as resp:
@@ -310,7 +326,7 @@ def _send(cfg: dict, message: dict) -> tuple[int, bytes]:
     req = urllib.request.Request(
         f"{server}/mcp",
         data=json.dumps(message).encode(),
-        headers={"Content-Type": "application/json", **auth},
+        headers={"Content-Type": "application/json", "X-Anamnesis-Client": CLIENT_TAG, **auth},
     )
     try:
         with _OPENER.open(req, timeout=TIMEOUT_S) as resp:

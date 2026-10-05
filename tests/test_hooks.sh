@@ -1,7 +1,7 @@
 #!/bin/bash
 # Codex hooks against a stand-in server (tests/mock_server.py): the capture
-# switch, escaping, the rollout extractor, large transcripts, session ids
-# and the sign-in warning.
+# switch, escaping, the rollout extractor, large transcripts, session ids,
+# the sign-in warning, the recall budget and failure notices.
 set -u
 cd "$(dirname "$0")/.."
 HOOKS="$PWD/plugins/anamnesis/hooks"
@@ -149,12 +149,65 @@ routes '{}'
 stop "$T" >/dev/null
 check "double failure: the next Stop resends the delta" "$(sent_transcript | grep -c '^user: remember the blue door$')" 1
 
+# A rejected sign-in is shown once per session.
 new_home
 routes '{"/mcp/tools/retrieve_memories": {"status": 401}}'
 m1="$(echo '{"prompt":"q","session_id":"s1"}' | "$HOOKS/user-prompt-submit.sh" | jq -r '.systemMessage // empty')"
 m2="$(echo '{"prompt":"q","session_id":"s1"}' | "$HOOKS/user-prompt-submit.sh" | jq -r '.systemMessage // empty')"
-check "401 warns" "$(grep -c 'rejected your sign-in' <<<"$m1")" 1
+check "401 warns" "$(grep -c 'sign in again' <<<"$m1")" 1
 check "401 warns once per session" "$m2" ""
+routes '{}'
+
+# Recall has an 8 s budget with one retry, and a failure is told once per
+# cause and logged with it. This client shows no success receipts, so a
+# recall that worked stays quiet.
+recall() { printf '{"prompt":"%s","session_id":"%s"}' "${2:-q}" "$1" | "$HOOKS/user-prompt-submit.sh"; }
+notice() { recall "$@" | jq -r '.systemMessage // empty'; }
+failures() { cat "$ANAMNESIS_HOME/hook_errors.log" 2>/dev/null | grep -c retrieve_failed || true; }
+last_failure() { grep retrieve_failed "$ANAMNESIS_HOME/hook_errors.log" | tail -1 | jq -r .detail; }
+HIT='{"status": "ok", "headlines": ["the blue door"], "results": [{"id": 1}]}'
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"delay": 10}}'
+start=$SECONDS
+out="$(recall s)"
+check "prompt returns within the 8 s budget" "$([ $((SECONDS - start)) -le 10 ] && echo fast)" fast
+check "time anchor survives a timeout" "$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -c '<current-datetime')" 1
+check "timeout: the user is told" "$(jq -r '.systemMessage' <<<"$out")" '[anamnesis] recall unavailable this turn (timed out after 8 s)'
+check "timeout: logged with curl exit, status, time and deadline" "$(last_failure | grep -c '^request: curl exit 28, HTTP 000, 8\.[0-9]* s against the 8 s deadline, 1 attempt$')" 1
+routes "{\"/mcp/tools/retrieve_memories\": {\"delay\": 4, \"body\": $HIT}}"
+out="$(recall s)"
+check "a 4 s answer is injected, quietly" "$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -c 'the blue door') $(jq -r '.systemMessage // empty' <<<"$out")" "1 "
+check "every request names the client and its manifest version" "$(grep retrieve_memories "$SRV/requests" | tail -1 | jq -r .client)" "codex/$(jq -r .version plugins/anamnesis/.codex-plugin/plugin.json)"
+new_home
+routes "{\"/mcp/tools/retrieve_memories\": {\"status\": 503, \"then\": {\"body\": $HIT}}}"
+check "503 then 200: retried, recalled, quiet" "$(recall s | jq -r '.hookSpecificOutput.additionalContext' | grep -c 'the blue door') $(count_req retrieve_memories) $(failures)" "1 2 0"
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"status": 429, "headers": {"Retry-After": "30"}}}'
+check "429: told, not retried, wait logged" "$(notice s) $(count_req retrieve_memories) $(last_failure | grep -c 'Retry-After 30 s$')" "[anamnesis] recall unavailable this turn (server 429) 1 1"
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"status": 422}}'
+check "422: told, not retried" "$(notice s) $(count_req retrieve_memories)" "[anamnesis] recall unavailable this turn (server 422) 1"
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"body": {"status": "ok", "token": "planted-secret-shape"}}}'
+check "a 200 that is not a recall answer is a parse failure" "$(notice s planted-secret-prompt)" "[anamnesis] recall unavailable this turn (unexpected reply)"
+check "parse failure logged, nothing planted in it" "$(last_failure | grep -c '^response_parse: curl exit 0, HTTP 200, ') $(grep -c planted-secret "$ANAMNESIS_HOME/hook_errors.log")" "1 0"
+routes "{\"/mcp/tools/retrieve_memories\": {\"body\": $HIT}}"
+check "success stays quiet" "$(notice seq)" ""
+routes '{"/mcp/tools/retrieve_memories": {"status": 503}}'
+check "first failure after a success is told" "$(notice seq)" "[anamnesis] recall unavailable this turn (server 503)"
+check "the same failure again is not" "$(notice seq)" ""
+routes "{\"/mcp/tools/retrieve_memories\": {\"body\": $HIT}}"
+notice seq >/dev/null
+routes '{"/mcp/tools/retrieve_memories": {"status": 503}}'
+check "a failure after a recovery is told again" "$(notice seq)" "[anamnesis] recall unavailable this turn (server 503)"
+routes '{}'
+new_home
+check "capture off: no notice, no log" "$(ANAMNESIS_CAPTURE=off notice s)|$(failures)" "|0"
+jq '.expires_at = 0' "$ANAMNESIS_HOME/config.json" > "$ANAMNESIS_HOME/config.tmp" && mv "$ANAMNESIS_HOME/config.tmp" "$ANAMNESIS_HOME/config.json"
+echo '{"refresh_token": "rt9"}' > "$SRV/oauth.json"
+check "invalid_grant: sign-in warning with no request made" "$(notice s) $(count_req retrieve_memories)" '[anamnesis] recall unavailable this turn (sign in again: `anamnesis-config`) 0'
+check "invalid_grant: logged as a refresh-stage failure" "$(last_failure | grep -c '^token_refresh: curl exit 0, HTTP 400, .* invalid_grant$')" 1
+check "the refresh names the client too" "$(grep oauth/token "$SRV/requests" | tail -1 | jq -r .client)" "codex/$(jq -r .version plugins/anamnesis/.codex-plugin/plugin.json)"
 routes '{}'
 
 exit $fail
