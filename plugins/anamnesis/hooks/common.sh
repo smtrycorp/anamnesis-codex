@@ -404,7 +404,7 @@ anamnesis_queue_entry_binding() {
     jq -r '[(.server_url // ""), (.credential // "")] | join("\u001f")' < "$1" 2>/dev/null
 }
 
-# Usage: anamnesis_drain_queue [max-files]
+# Usage: anamnesis_drain_queue
 # Replays queued payloads oldest first. A payload queued under another
 # sign-in or server, or one the server refuses for good, is set aside in
 # pending_uploads/quarantine so the rest can drain; the drain stops at a
@@ -412,7 +412,8 @@ anamnesis_queue_entry_binding() {
 # nothing while another drain holds the queue lock. Run it in the
 # background: it does network work.
 anamnesis_drain_queue() {
-    local max="${1:-20}" lock="$ANAMNESIS_QUEUE_DIR/.drain.lck" sent=0 f path body mine
+    # Twenty per drain bounds one hook's network time; the rest wait for the next Stop.
+    local max=20 lock="$ANAMNESIS_QUEUE_DIR/.drain.lck" sent=0 f path body mine
     anamnesis_lock_acquire "$lock" 0 || return 0
     if ! mine="$(anamnesis_signin_binding)"; then
         anamnesis_lock_release "$lock"
