@@ -8,7 +8,7 @@
     "url": "https://smtry.ai"
   },
   "homepage": "https://anamnesis.smtry.ai",
-  "repository": "https://github.com/israelashley/anamnesis-codex",
+  "repository": "https://github.com/smtrycorp/anamnesis-codex",
   "license": "MIT",
   "keywords": ["memory", "mcp", "persistent-memory", "cross-product", "recall"],
   "mcpServers": "./.mcp.json",

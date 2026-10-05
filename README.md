@@ -7,8 +7,8 @@ says exactly who can decrypt what. Browse, search, and delete any memory
 at [anamnesis.smtry.ai/memory](https://anamnesis.smtry.ai/memory). What
 is sent, and when, is in [PRIVACY.md](PRIVACY.md).
 
-Companion to [`anamnesis-claude-code`](https://github.com/israelashley/anamnesis-claude-code)
-and [`anamnesis-gemini-cli`](https://github.com/israelashley/anamnesis-gemini-cli).
+Companion to [`anamnesis-claude-code`](https://github.com/smtrycorp/anamnesis-claude-code)
+and [`anamnesis-gemini-cli`](https://github.com/smtrycorp/anamnesis-gemini-cli).
 Same backend, same memory root, same engrams — your work in Codex,
 Gemini, and Claude lands in one place.
 
@@ -17,7 +17,7 @@ Gemini, and Claude lands in one place.
 Two steps — adding the marketplace does NOT install the plugin:
 
 ```
-codex plugin marketplace add israelashley/anamnesis-codex
+codex plugin marketplace add smtrycorp/anamnesis-codex
 codex plugin add anamnesis@smtry
 ```
 
