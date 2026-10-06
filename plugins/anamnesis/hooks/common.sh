@@ -1077,8 +1077,6 @@ anamnesis_queue_payload() {
 # a slow or unreachable server never delays the session. A probe that gets a
 # 401 records it, and the next prompt shows the sign-in warning.
 anamnesis_start_background_sync() {
-    local monitor=""
-    case "$-" in *m*) monitor=1 ;; esac
     set -m
     {
         # The background has the time a foreground hook has not: no deadline,
@@ -1093,7 +1091,10 @@ anamnesis_start_background_sync() {
     } </dev/null >/dev/null 2>&1 &
     # Its own process group (set -m around the fork): a supervisor stopping
     # the hook's work stops that group, and this sync is meant to outlive it.
-    [ -n "$monitor" ] || set +m
+    # Job control goes off again whatever "$-" said before: bash 3.2 reports
+    # it on in a child where it is off, and left on it would put the work's
+    # later commands in groups of their own.
+    set +m
 }
 
 # Removes what a hook stopped outright left behind (SIGKILL runs no trap):
@@ -1115,7 +1116,7 @@ anamnesis_sweep_abandoned() {
             rm -rf "$d"
         done
     find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'anamnesis-pid.??????' -type f -user "$me" -mmin +10 -delete 2>/dev/null
-    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'anamnesis-out.??????*' -type f -user "$me" -mmin +10 -delete 2>/dev/null
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'anamnesis-out.??????' -type d -user "$me" -mmin +10 -exec rm -rf {} + 2>/dev/null
     find "$ANAMNESIS_HOME" -maxdepth 1 -name 'config.json.??????' -type f -user "$me" -mmin +10 -delete 2>/dev/null
     return 0
 }

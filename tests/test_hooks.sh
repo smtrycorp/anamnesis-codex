@@ -471,12 +471,51 @@ check "a host stop returns at once and stops a stuck command" "$([ $((SECONDS - 
 # No output file: the hook says so and does not run the work unsupervised.
 out="$(TMPDIR="$WORK/no-such-dir" bash -c '. "$0"; w() { echo ran >&2; sleep 5; }; anamnesis_supervise UserPromptSubmit 1 "late" "[anamnesis] failed" w' "$HOOKS/common.sh")"
 check "no output file: failure notice, work not run" "$(jq -r .systemMessage <<<"$out")" "[anamnesis] failed"
-# The timer signals only its own hook: a PID that died, or now runs
-# something else, is left alone.
-sleep 30 &
-other=$!
-check "the timer's owner check" "$(bash -c '. "$0"; me="$(ps -o command= -p $$)"; anamnesis_supervise_owns $$ "$me" && echo self; anamnesis_supervise_owns "$1" "$me" || echo other; anamnesis_supervise_owns 999999 "$me" || echo dead' "$HOOKS/common.sh" "$other" | tr '\n' ' ')" "self other dead "
-kill "$other" 2>/dev/null
+# A hook killed outright (KILL, no trap runs) still has its work stopped:
+# the timer learns of the death from its pipe closing, not from a PID.
+bash -c '. "$0"; n="$1"; w() { sleep "36.$n"; }; anamnesis_supervise X 30 "late" "" w' "$HOOKS/common.sh" "$n" > /dev/null &
+victim=$!
+sleep 0.5
+kill -KILL "$victim"
+sleep 0.8
+check "a hook killed outright still has its work stopped" "$(pgrep -f "sleep 36\\.$n" | wc -l | tr -d ' ')" 0
+# The output is staged where no other account can read it, whatever the
+# host's umask.
+out="$(umask 022; bash -c '. "$0"; w() { ls -ld "$ANAMNESIS_SUPERVISED_DIR" | cut -c1-10 >&7; printf "{}\n"; }; anamnesis_supervise X 5 "late" "failed" w 7>"$1"' "$HOOKS/common.sh" "$WORK/perm.out"; cat "$WORK/perm.out")"
+check "staged output is private under umask 022" "$(tail -1 <<<"$out")" "drwx------"
+# Starting the background sync leaves the work's later commands in the
+# work's group, so the limit still stops them.
+out="$(bash -c '. "$0"; n="$1"; anamnesis_sweep_abandoned() { :; }; anamnesis_drain_queue() { :; }; anamnesis_post() { return 0; }; w() { anamnesis_start_background_sync; sleep "37.$n"; }; anamnesis_supervise X 1 "[anamnesis] stopped" "" w' "$HOOKS/common.sh" "$n")"
+sleep 0.5
+check "after starting the sync, the limit still stops the work" "$(jq -r .systemMessage <<<"$out") $(pgrep -f "sleep 37\\.$n" | wc -l | tr -d ' ')" "[anamnesis] stopped 0"
+# With no jq to check it, work output is not passed on; the notice handed
+# over through anamnesis_plain_output is, printed by the supervisor.
+mkdir -p "$WORK/jq127"
+printf '#!/bin/sh\nexit 127\n' > "$WORK/jq127/jq"
+chmod +x "$WORK/jq127/jq"
+new_home
+out="$(PATH="$WORK/jq127:$PATH" bash -c '. "$0"; w() { printf "{\"hookSpecificOutput\":"; }; anamnesis_supervise UserPromptSubmit 5 "late" "[anamnesis] failed" w' "$HOOKS/common.sh")"
+check "unchecked output is not passed on" "$(/usr/bin/jq -r .systemMessage <<<"$out") $(grep -c 'no jq to check' "$ANAMNESIS_HOME/hook_errors.log")" "[anamnesis] failed 1"
+out="$(PATH="$WORK/jq127:$PATH" bash -c '. "$0"; w() { anamnesis_plain_output UserPromptSubmit "jq and curl must \"both\" be on PATH"; }; anamnesis_supervise UserPromptSubmit 5 "late" "failed" w' "$HOOKS/common.sh")"
+check "a handed-over notice is printed by the supervisor, quotes removed" "$(/usr/bin/jq -r .systemMessage <<<"$out")" "jq and curl must both be on PATH"
+# A clock that cannot be read leaves a fixed word in the late notice, and
+# the late path calls nothing more.
+mkdir -p "$WORK/nodate"
+printf '#!/bin/sh\nsleep 3; exit 1\n' > "$WORK/nodate/date"
+chmod +x "$WORK/nodate/date"
+start=$SECONDS
+out="$(PATH="$WORK/nodate:$PATH" bash -c '. "$0"; w() { sleep 20; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" "" w' "$HOOKS/common.sh")"
+check "a clock that cannot be read: late notice on time, fixed time word" "$([ $((SECONDS - start)) -le 8 ] && echo bounded) $(jq -r .hookSpecificOutput.additionalContext <<<"$out" | grep -c 'time unavailable')" "bounded 1"
+# The sweep takes old supervisor directories only, nothing else with the
+# same prefix.
+new_home
+d="$(mktemp -d "${TMPDIR:-/tmp}/anamnesis-out.XXXXXX")"
+keep="${TMPDIR:-/tmp}/anamnesis-out.keep-this-report.$$"
+: > "$keep"
+touch -t 202601010000 "$d" "$keep"
+bash -c '. "$0"; anamnesis_sweep_abandoned' "$HOOKS/common.sh"
+check "the sweep removes old supervisor directories only" "$([ -d "$d" ] && echo kept || echo gone) $([ -f "$keep" ] && echo kept || echo gone)" "gone kept"
+rm -f "$keep"
 # The whole hook is under the limit, loading the config included: a jq that
 # hangs on every call still gets an answer inside the host's 15 s.
 new_home
