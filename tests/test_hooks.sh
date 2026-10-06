@@ -421,15 +421,28 @@ chmod +x "$WORK/brokenjq/jq"
 check "no config and no jq: nothing on stdout or stderr" "$(echo '{"prompt":"q"}' | PATH="$WORK/brokenjq:$PATH" "$HOOKS/user-prompt-submit.sh" 2>&1 | wc -c | tr -d ' ')" 0
 check "the jq-less notice is valid hook JSON" "$(bash -c '. "$0"; anamnesis_plain_output UserPromptSubmit "jq and curl must both be on PATH"' "$HOOKS/common.sh" | jq -r '.systemMessage + " " + (.hookSpecificOutput.additionalContext | test("<current-datetime") | tostring)')" "jq and curl must both be on PATH true"
 
-# A clock that steps backwards hands out no time, and the watchdog ends the
-# hook at the cap whatever the clock says.
+# A clock that steps backwards hands out no time.
 new_home
 echo 100 > "$WORK/clock"
 out="$(ANAMNESIS_TEST_CLOCK="$WORK/clock" bash -c '. "$0"; anamnesis_set_deadline 8 12 X; echo 40 > "$1"; ANAMNESIS_RETRY=1; ANAMNESIS_ATTEMPTS=1; ANAMNESIS_CURL_EXIT=0; ANAMNESIS_STATUS=503; printf "Retry-After: 60\r\n" > "$1.h"; anamnesis_retry_due "$1.h" && echo retry || echo no-retry; anamnesis_time_left' "$HOOKS/common.sh" "$WORK/clock")"
 check "a clock step back grants no retry" "$(head -1 <<<"$out") $(tail -1 <<<"$out" | LC_ALL=C awk '{ print ($1 <= 8) ? "bounded" : "unbounded" }')" "no-retry bounded"
+# The supervisor ends the hook at its limit whatever the work is stuck in,
+# with one notice, even when the work's own stdout is redirected.
+new_home
 start=$SECONDS
-out="$(bash -c '. "$0"; anamnesis_set_deadline 1 1 X; ANAMNESIS_ON_DEADLINE="echo watchdog-fired"; anamnesis_pause 10; echo not-reached' "$HOOKS/common.sh")"
-check "the watchdog ends the hook at the cap" "$? $(tr '\n' ' ' <<<"$out") $([ $((SECONDS - start)) -le 4 ] && echo quick) $(grep -c deadline_hit "$ANAMNESIS_HOME/hook_errors.log")" "0 watchdog-fired  quick 1"
+out="$(bash -c '. "$0"; anamnesis_load_config; w() { anamnesis_pause 10 >/dev/null; echo not-reached; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" w; echo after' "$HOOKS/common.sh")"
+check "the supervisor ends stuck work at its limit, one notice" "$? $(jq -c . <<<"$out" | wc -l | tr -d ' ') $(jq -r .systemMessage <<<"$out") $(grep -c 'not-reached\|after' <<<"$out") $([ $((SECONDS - start)) -le 3 ] && echo quick) $(grep -c deadline_hit "$ANAMNESIS_HOME/hook_errors.log")" "0 1 [anamnesis] stopped 0 quick 1"
+# Work that finishes in time is printed as it wrote it.
+out="$(bash -c '. "$0"; w() { echo one; echo two; }; anamnesis_supervise X 5 "late" w' "$HOOKS/common.sh")"
+check "finished work is printed whole" "$(tr '\n' ' ' <<<"$out")" "one two "
+# A host stop ends the work too and prints nothing.
+new_home
+bash -c '. "$0"; n="$1"; w() { anamnesis_pause "23.$n"; echo late-output; }; anamnesis_supervise X "31.$n" "late" w' "$HOOKS/common.sh" "$$" > "$WORK/stopped.out" &
+sup=$!
+sleep 1
+kill -TERM "$sup"
+wait "$sup"
+check "a host stop prints nothing and leaves no work running" "$? $(wc -c < "$WORK/stopped.out" | tr -d ' ') $(pgrep -f "sleep (23|31)\\.$$" | wc -l | tr -d ' ') $(pgrep -f "anamnesis_supervise X 31" | xargs -n1 ps -o args= -p 2>/dev/null | grep -c " $$\$")" "0 0 0 0"
 
 # One refresh per process, and none with under three seconds left.
 new_home
@@ -458,38 +471,34 @@ check "a Retry-After from attempt 1 is not logged against attempt 2" "$(last_fai
 routes '{}'
 
 
-# An ALRM landing while the output is being written adds no second object.
+# A jq that hangs while the output is built (the final review's repro):
+# the real hook still answers inside the host's 15 s, once.
 new_home
 routes "{\"/mcp/tools/retrieve_memories\": {\"body\": $HIT}}"
 mkdir -p "$WORK/slowjq"
-printf '#!/bin/sh\ncase "$*" in *hookSpecificOutput*) sleep 2 ;; esac\nexec /usr/bin/jq "$@"\n' > "$WORK/slowjq/jq"
+printf '#!/bin/sh\ncase "$*" in *hookSpecificOutput*) sleep 30 ;; esac\nexec /usr/bin/jq "$@"\n' > "$WORK/slowjq/jq"
 chmod +x "$WORK/slowjq/jq"
-PATH="$WORK/slowjq:$PATH" "$HOOKS/user-prompt-submit.sh" <<<'{"prompt":"q","session_id":"s"}' > "$WORK/alrm.out" &
-victim=$!
-sleep 1
-kill -ALRM "$victim"
-wait "$victim"
-check "a watchdog signal while the output is built ends the hook with the deadline output, once" "$? $(jq -c . "$WORK/alrm.out" | wc -l | tr -d ' ') $(jq -r '.systemMessage' "$WORK/alrm.out" | grep -c 'timed out')" "0 1 1"
+start=$SECONDS
+out="$(PATH="$WORK/slowjq:$PATH" "$HOOKS/user-prompt-submit.sh" <<<'{"prompt":"q","session_id":"s"}')"
+check "a hung output jq still ends the hook inside the host's 15 s, one notice" "$? $([ $((SECONDS - start)) -le 14 ] && echo in-time) $(printf '%s' "$out" | /usr/bin/jq -c . | wc -l | tr -d ' ') $(printf '%s' "$out" | /usr/bin/jq -r .systemMessage | grep -c 'stopped at the 13 s limit')" "0 in-time 1 1"
 routes '{}'
 
 
 # Review round 6.
-# The watchdog's output reaches the hook's stdout even when the signal lands
-# inside a request whose own stdout is /dev/null.
-new_home
-out="$(bash -c '. "$0"; anamnesis_load_config; ANAMNESIS_SID=s; anamnesis_set_deadline 0.5 0.5 X; ANAMNESIS_ON_DEADLINE="anamnesis_prompt_deadline UserPromptSubmit"; anamnesis_pause 2 >/dev/null; echo not-reached' "$HOOKS/common.sh")"
-check "deadline output survives a redirected request" "$? $(jq -c . <<<"$out" | wc -l | tr -d ' ') $(jq -r .systemMessage <<<"$out" | grep -c 'timed out') $(grep -c not-reached <<<"$out")" "0 1 1 0"
 
-# A refresh keeps its rotated token through a watchdog signal, and the
-# deadline is acted on once the token is safe.
+# A token being saved when the limit passes is saved anyway: the hook
+# answers at the limit and the work finishes the rename on its own.
 new_home
 jq '.expires_at = 0' "$ANAMNESIS_HOME/config.json" > "$ANAMNESIS_HOME/config.tmp" && mv "$ANAMNESIS_HOME/config.tmp" "$ANAMNESIS_HOME/config.json"
 echo '{"refresh_token": "rt0"}' > "$SRV/oauth.json"
 mkdir -p "$WORK/slowpersist"
-printf '#!/bin/sh\ncase "$*" in *--slurpfile\\ r*) sleep 5 ;; esac\nexec /usr/bin/jq "$@"\n' > "$WORK/slowpersist/jq"
+printf '#!/bin/sh\ncase "$*" in *--slurpfile\\ r*) sleep 4 ;; esac\nexec /usr/bin/jq "$@"\n' > "$WORK/slowpersist/jq"
 chmod +x "$WORK/slowpersist/jq"
-PATH="$WORK/slowpersist:$PATH" bash -c '. "$0"; anamnesis_load_config; ANAMNESIS_SID=s; anamnesis_set_deadline 4 4 X; anamnesis_ensure_token; echo not-reached' "$HOOKS/common.sh" > "$WORK/persist.out"
-check "a rotated token is kept through the watchdog, then the deadline is acted on" "$? $(jq -r '.access_token + " " + .refresh_token' "$ANAMNESIS_HOME/config.json") $(grep -c deadline_hit "$ANAMNESIS_HOME/hook_errors.log") $(grep -c not-reached "$WORK/persist.out")" "0 at1 rt1 1 0"
+start=$SECONDS
+out="$(PATH="$WORK/slowpersist:$PATH" bash -c '. "$0"; anamnesis_load_config; w() { anamnesis_ensure_token; echo not-reached; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" w' "$HOOKS/common.sh")"
+took=$((SECONDS - start))
+sleep 5
+check "a token saved past the limit is kept, the hook answered at the limit" "$([ "$took" -le 3 ] && echo in-time) $(jq -r .systemMessage <<<"$out") $(jq -r '.access_token + " " + .refresh_token' "$ANAMNESIS_HOME/config.json")" "in-time [anamnesis] stopped at1 rt1"
 
 # The three-second floor is checked again after the lock wait.
 new_home
@@ -510,8 +519,5 @@ chmod +x "$WORK/nojq127/jq"
 check "anamnesis-config --help works without jq" "$(PATH="$WORK/nojq127:$PATH" plugins/anamnesis/bin/anamnesis-config --help 2>&1 | grep -q 'anamnesis-config' && echo ok)" ok
 check "anamnesis-config names the missing tool" "$(PATH="$WORK/nojq127:$PATH" plugins/anamnesis/bin/anamnesis-config --server "$URL" 2>&1 | grep -c 'missing required tool: jq')" 1
 
-# An unreadable clock does not end the hook when the deadline is re-armed.
-out="$(bash -c '. "$0"; anamnesis_time_left() { :; }; ANAMNESIS_DEADLINE=8 ANAMNESIS_DEADLINE_CAP=12; anamnesis_deadline_arm; echo still-running' "$HOOKS/common.sh")"
-check "re-arming with no clock figure leaves the hook running" "$out" "still-running"
 
 exit $fail
