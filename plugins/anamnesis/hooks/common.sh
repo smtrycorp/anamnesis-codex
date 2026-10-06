@@ -16,6 +16,10 @@ umask 077
 # jq and curl ahead of the system ones.
 PATH="${PATH:+$PATH:}/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
+# The supervisor and the jq-less output; a hook that runs under the
+# supervisor has sourced it already, and a second source changes nothing.
+# shellcheck source=supervise.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/supervise.sh"
 
 ANAMNESIS_HOME="${ANAMNESIS_HOME:-$HOME/.anamnesis}"
 ANAMNESIS_CONFIG="$ANAMNESIS_HOME/config.json"
@@ -55,13 +59,6 @@ ANAMNESIS_PRIOR_TRAP_EXIT=""
 ANAMNESIS_PRIOR_TRAP_INT=""
 ANAMNESIS_PRIOR_TRAP_TERM=""
 ANAMNESIS_PRIOR_TRAP_HUP=""
-# The supervisor's state while it waits on a hook's work (anamnesis_supervise).
-ANAMNESIS_SUPERVISED_WORKER=""
-ANAMNESIS_SUPERVISED_TIMER=""
-ANAMNESIS_SUPERVISED_OUT=""
-ANAMNESIS_SUPERVISED_EVENT=""
-ANAMNESIS_SUPERVISED_LATE=""
-ANAMNESIS_SUPERVISED_CAP=""
 # Seconds this hook has itself accounted for (curl times, waits, lock
 # ticks): the floor under the clock, which can step backwards.
 ANAMNESIS_SPENT=0
@@ -1080,6 +1077,9 @@ anamnesis_queue_payload() {
 # a slow or unreachable server never delays the session. A probe that gets a
 # 401 records it, and the next prompt shows the sign-in warning.
 anamnesis_start_background_sync() {
+    local monitor=""
+    case "$-" in *m*) monitor=1 ;; esac
+    set -m
     {
         # The background has the time a foreground hook has not: no deadline,
         # and the full wait for a refresh another process is running.
@@ -1091,6 +1091,9 @@ anamnesis_start_background_sync() {
             || [ "$ANAMNESIS_FAIL_STAGE" = "capture_off" ] \
             || anamnesis_log_error "session_start_health_probe_failed" "sid=$ANAMNESIS_SID; $(anamnesis_failure_detail)"
     } </dev/null >/dev/null 2>&1 &
+    # Its own process group (set -m around the fork): a supervisor stopping
+    # the hook's work stops that group, and this sync is meant to outlive it.
+    [ -n "$monitor" ] || set +m
 }
 
 # Removes what a hook stopped outright left behind (SIGKILL runs no trap):
@@ -1112,7 +1115,7 @@ anamnesis_sweep_abandoned() {
             rm -rf "$d"
         done
     find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'anamnesis-pid.??????' -type f -user "$me" -mmin +10 -delete 2>/dev/null
-    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'anamnesis-out.??????' -type f -user "$me" -mmin +10 -delete 2>/dev/null
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'anamnesis-out.??????*' -type f -user "$me" -mmin +10 -delete 2>/dev/null
     find "$ANAMNESIS_HOME" -maxdepth 1 -name 'config.json.??????' -type f -user "$me" -mmin +10 -delete 2>/dev/null
     return 0
 }
@@ -1139,92 +1142,10 @@ anamnesis_gap_notice() {
 # continue as top-level context.
 ANAMNESIS_JQ_DEFANG='def defang: gsub("<(?<t>\\s*/?\\s*anamnesis)"; "&lt;\(.t)"; "i");'
 
-# Usage: anamnesis_supervise <event> <cap> <late-message> <command> [args...]
-# Runs a hook's work in a child shell with its output going to a file, and
-# prints that output only once the child has finished. The parent does
-# nothing but wait, which is the one thing bash always interrupts, so when
-# <cap> seconds pass it can still stop on time whatever the child is stuck
-# in: a jq, a curl, a lock, a clock that moved. It then prints the anchor
-# and <late-message> (nothing if that is empty) with printf alone and
-# exits. The child gets TERM; one saving a rotated token ignores it, keeps
-# running to the rename and writes to a file no one reads. With no file
-# to hand the output through, the work runs unsupervised, as before 0.4.4.
-anamnesis_supervise() {
-    local event="$1" cap="$2" late="$3" self
-    shift 3
-    if ! ANAMNESIS_SUPERVISED_OUT="$(mktemp "${TMPDIR:-/tmp}/anamnesis-out.XXXXXX" 2>/dev/null)" \
-        || ! anamnesis_self_pid; then
-        ANAMNESIS_SUPERVISED_OUT=""
-        "$@"
-        return 0
-    fi
-    self="$ANAMNESIS_SELF_PID"
-    ANAMNESIS_SUPERVISED_EVENT="$event" ANAMNESIS_SUPERVISED_LATE="$late" ANAMNESIS_SUPERVISED_CAP="$cap"
-    trap 'anamnesis_supervise_stop' INT TERM HUP
-    trap 'anamnesis_supervise_late' ALRM
-    # The work installs the cleanup traps first, so a stop also ends the
-    # curl or sleep it is waiting on instead of orphaning it.
-    ( anamnesis_trap_install; "$@" ) >"$ANAMNESIS_SUPERVISED_OUT" 2>/dev/null </dev/null &
-    ANAMNESIS_SUPERVISED_WORKER=$!
-    ( sleep "$cap"; kill -ALRM "$self" ) >/dev/null 2>&1 </dev/null &
-    ANAMNESIS_SUPERVISED_TIMER=$!
-    wait "$ANAMNESIS_SUPERVISED_WORKER" 2>/dev/null
-    # Whichever comes first prints: from here an ALRM is ignored, and one
-    # that landed before this line has already printed and exited.
-    trap '' ALRM
-    anamnesis_supervise_timer_stop
-    cat "$ANAMNESIS_SUPERVISED_OUT" 2>/dev/null
-    rm -f "$ANAMNESIS_SUPERVISED_OUT"
-    trap - INT TERM HUP
-    return 0
-}
-
-# The timer and the sleep inside it, which would otherwise run out the cap.
-anamnesis_supervise_timer_stop() {
-    [ -n "$ANAMNESIS_SUPERVISED_TIMER" ] || return 0
-    pkill -P "$ANAMNESIS_SUPERVISED_TIMER" 2>/dev/null || :
-    kill "$ANAMNESIS_SUPERVISED_TIMER" 2>/dev/null || :
-    ANAMNESIS_SUPERVISED_TIMER=""
-}
-
-# The cap passed. Nothing here can block: no jq, no network, no clock
-# arithmetic.
-anamnesis_supervise_late() {
-    trap '' ALRM INT TERM HUP
-    anamnesis_supervise_timer_stop
-    kill "$ANAMNESIS_SUPERVISED_WORKER" 2>/dev/null || :
-    printf '{"ts":"%s","event":"deadline_hit","detail":"the %s s limit passed; the work was stopped"}\n' \
-        "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$ANAMNESIS_SUPERVISED_CAP" 2>/dev/null >> "$ANAMNESIS_ERROR_LOG"
-    [ -z "$ANAMNESIS_SUPERVISED_LATE" ] \
-        || anamnesis_plain_output "$ANAMNESIS_SUPERVISED_EVENT" "$ANAMNESIS_SUPERVISED_LATE"
-    rm -f "$ANAMNESIS_SUPERVISED_OUT"
-    exit 0
-}
-
-# The host stopped the hook: the work is stopped too and nothing is
-# printed. The wait lets the work remove what it was writing; a work saving
-# a rotated token finishes that first, and a host that will not wait sends
-# KILL, which leaves it running to the rename on its own.
-anamnesis_supervise_stop() {
-    trap '' ALRM INT TERM HUP
-    anamnesis_supervise_timer_stop
-    kill "$ANAMNESIS_SUPERVISED_WORKER" 2>/dev/null || :
-    wait "$ANAMNESIS_SUPERVISED_WORKER" 2>/dev/null || :
-    rm -f "$ANAMNESIS_SUPERVISED_OUT"
-    exit 0
-}
-
-# Usage: anamnesis_prompt_supervised <hook-event-name> <yes|no>
 # A prompt hook's recall under one budget, 3 s inside the 15 s the host
-# gives the hook, and the supervisor's hard stop at 13 s. The budget covers
+# gives the hook; the supervisor's hard stop is at 13 s. The budget covers
 # the token refresh and one retry; the wait for another process's refresh
 # is two half-second ticks.
-anamnesis_prompt_supervised() {
-    anamnesis_supervise "$1" 13 \
-        "[anamnesis] recall unavailable this turn (stopped at the 13 s limit)" \
-        anamnesis_prompt_recall "$1" "$2"
-}
-
 anamnesis_prompt_recall() {
     anamnesis_set_deadline "${ANAMNESIS_PROMPT_TIMEOUT:-8}" 12 ANAMNESIS_PROMPT_TIMEOUT
     ANAMNESIS_RETRY=1
@@ -1306,16 +1227,6 @@ anamnesis_config_fault_hook() {
     else
         anamnesis_plain_output "$1" "$msg"
     fi
-}
-
-# Usage: anamnesis_plain_output <hook-event-name> <message>
-# The hook's JSON without jq, for the one fault jq cannot report: only the
-# date/time anchor and the fixed message, neither of which holds a quote.
-anamnesis_plain_output() {
-    printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"<current-datetime local=\\"%s\\" source=\\"anamnesis\\"/>"}' \
-        "$1" "$(date '+%a, %d %b %Y %H:%M:%S %z')"
-    [ -z "$2" ] || printf ',"systemMessage":"%s"' "$2"
-    printf '}\n'
 }
 
 # Prints the hook's JSON: the recalled lines (if any) and the date/time

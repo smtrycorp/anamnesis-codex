@@ -430,19 +430,63 @@ check "a clock step back grants no retry" "$(head -1 <<<"$out") $(tail -1 <<<"$o
 # with one notice, even when the work's own stdout is redirected.
 new_home
 start=$SECONDS
-out="$(bash -c '. "$0"; anamnesis_load_config; w() { anamnesis_pause 10 >/dev/null; echo not-reached; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" w; echo after' "$HOOKS/common.sh")"
+out="$(bash -c '. "$0"; anamnesis_load_config; w() { anamnesis_pause 10 >/dev/null; echo not-reached; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" "[anamnesis] failed" w; echo after' "$HOOKS/common.sh")"
 check "the supervisor ends stuck work at its limit, one notice" "$? $(jq -c . <<<"$out" | wc -l | tr -d ' ') $(jq -r .systemMessage <<<"$out") $(grep -c 'not-reached\|after' <<<"$out") $([ $((SECONDS - start)) -le 3 ] && echo quick) $(grep -c deadline_hit "$ANAMNESIS_HOME/hook_errors.log")" "0 1 [anamnesis] stopped 0 quick 1"
 # Work that finishes in time is printed as it wrote it.
-out="$(bash -c '. "$0"; w() { echo one; echo two; }; anamnesis_supervise X 5 "late" w' "$HOOKS/common.sh")"
-check "finished work is printed whole" "$(tr '\n' ' ' <<<"$out")" "one two "
+out="$(bash -c '. "$0"; w() { printf "{\"a\":\n1}\n"; }; anamnesis_supervise X 5 "late" "failed" w' "$HOOKS/common.sh")"
+check "finished work is printed whole" "$(tr '\n' ' ' <<<"$out")" '{"a": 1} '
+# Work that fails, or prints anything but one JSON object, is never passed
+# on: the fixed failure notice goes out instead, and the failure is logged.
+new_home
+for body in 'printf "{\"hookSpecificOutput\":"; return 17' 'return 127' 'printf "{\"hookSpecificOutput\":"' 'echo "{}"; echo "{}"'; do
+    out="$(bash -c '. "$0"; eval "w() { $1; }"; anamnesis_supervise UserPromptSubmit 5 "late" "[anamnesis] failed" w' "$HOOKS/common.sh" "$body")"
+    check "failed work ($body) prints the failure notice only" "$(jq -c . <<<"$out" | wc -l | tr -d ' ') $(jq -r .systemMessage <<<"$out")" "1 [anamnesis] failed"
+done
+check "each failed work is logged" "$(grep -c work_failed "$ANAMNESIS_HOME/hook_errors.log")" 4
+# Work that ends cleanly with nothing to say prints nothing.
+check "silent work stays silent" "$(bash -c '. "$0"; w() { :; }; anamnesis_supervise UserPromptSubmit 5 "late" "failed" w' "$HOOKS/common.sh" | wc -c | tr -d ' ')" 0
 # A host stop ends the work too and prints nothing.
 new_home
-bash -c '. "$0"; n="$1"; w() { anamnesis_pause "23.$n"; echo late-output; }; anamnesis_supervise X "31.$n" "late" w' "$HOOKS/common.sh" "$$" > "$WORK/stopped.out" &
+bash -c '. "$0"; n="$1"; w() { anamnesis_pause "23.$n"; echo late-output; }; anamnesis_supervise X "31.$n" "late" "" w' "$HOOKS/common.sh" "$$" > "$WORK/stopped.out" &
 sup=$!
 sleep 1
 kill -TERM "$sup"
 wait "$sup"
 check "a host stop prints nothing and leaves no work running" "$? $(wc -c < "$WORK/stopped.out" | tr -d ' ') $(pgrep -f "sleep (23|31)\\.$$" | wc -l | tr -d ' ') $(pgrep -f "anamnesis_supervise X 31" | xargs -n1 ps -o args= -p 2>/dev/null | grep -c " $$\$")" "0 0 0 0"
+# A foreground command the work is stuck in stops with it, at the limit and
+# on a host stop, and a host stop returns at once.
+n=$$
+start=$SECONDS
+out="$(bash -c '. "$0"; n="$1"; w() { sleep "33.$n"; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" "" w' "$HOOKS/common.sh" "$n")"
+sleep 0.5
+check "at the limit, a stuck foreground command is stopped too" "$(jq -r .systemMessage <<<"$out") $([ $((SECONDS - start)) -le 3 ] && echo quick) $(pgrep -f "sleep 33\\.$n" | wc -l | tr -d ' ')" "[anamnesis] stopped quick 0"
+bash -c '. "$0"; n="$1"; w() { sleep "34.$n"; }; anamnesis_supervise X 30 "late" "" w' "$HOOKS/common.sh" "$n" > /dev/null &
+sup=$!
+sleep 0.5
+start=$SECONDS
+kill -TERM "$sup"
+wait "$sup"
+sleep 0.3
+check "a host stop returns at once and stops a stuck command" "$([ $((SECONDS - start)) -le 1 ] && echo quick) $(pgrep -f "sleep 34\\.$n" | wc -l | tr -d ' ')" "quick 0"
+# No output file: the hook says so and does not run the work unsupervised.
+out="$(TMPDIR="$WORK/no-such-dir" bash -c '. "$0"; w() { echo ran >&2; sleep 5; }; anamnesis_supervise UserPromptSubmit 1 "late" "[anamnesis] failed" w' "$HOOKS/common.sh")"
+check "no output file: failure notice, work not run" "$(jq -r .systemMessage <<<"$out")" "[anamnesis] failed"
+# The timer signals only its own hook: a PID that died, or now runs
+# something else, is left alone.
+sleep 30 &
+other=$!
+check "the timer's owner check" "$(bash -c '. "$0"; me="$(ps -o command= -p $$)"; anamnesis_supervise_owns $$ "$me" && echo self; anamnesis_supervise_owns "$1" "$me" || echo other; anamnesis_supervise_owns 999999 "$me" || echo dead' "$HOOKS/common.sh" "$other" | tr '\n' ' ')" "self other dead "
+kill "$other" 2>/dev/null
+# The whole hook is under the limit, loading the config included: a jq that
+# hangs on every call still gets an answer inside the host's 15 s.
+new_home
+mkdir -p "$WORK/hangjq"
+printf '#!/bin/sh\nsleep 30\n' > "$WORK/hangjq/jq"
+chmod +x "$WORK/hangjq/jq"
+start=$SECONDS
+out="$(PATH="$WORK/hangjq:$PATH" "$HOOKS/user-prompt-submit.sh" <<<'{"prompt":"q","session_id":"s"}')"
+check "a jq that always hangs: answered inside 15 s, one notice" "$([ $((SECONDS - start)) -le 14 ] && echo in-time) $(printf '%s' "$out" | /usr/bin/jq -r .systemMessage)" "in-time [anamnesis] recall unavailable this turn (stopped at the 13 s limit)"
+pkill -f "$WORK/hangjq" 2>/dev/null
 
 # One refresh per process, and none with under three seconds left.
 new_home
@@ -495,7 +539,7 @@ mkdir -p "$WORK/slowpersist"
 printf '#!/bin/sh\ncase "$*" in *--slurpfile\\ r*) sleep 4 ;; esac\nexec /usr/bin/jq "$@"\n' > "$WORK/slowpersist/jq"
 chmod +x "$WORK/slowpersist/jq"
 start=$SECONDS
-out="$(PATH="$WORK/slowpersist:$PATH" bash -c '. "$0"; anamnesis_load_config; w() { anamnesis_ensure_token; echo not-reached; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" w' "$HOOKS/common.sh")"
+out="$(PATH="$WORK/slowpersist:$PATH" bash -c '. "$0"; anamnesis_load_config; w() { anamnesis_ensure_token; echo not-reached; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" "" w' "$HOOKS/common.sh")"
 took=$((SECONDS - start))
 sleep 5
 check "a token saved past the limit is kept, the hook answered at the limit" "$([ "$took" -le 3 ] && echo in-time) $(jq -r .systemMessage <<<"$out") $(jq -r '.access_token + " " + .refresh_token' "$ANAMNESIS_HOME/config.json")" "in-time [anamnesis] stopped at1 rt1"
