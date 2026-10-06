@@ -1227,6 +1227,7 @@ anamnesis_config_fault_hook() {
 # The hook's JSON without jq, for the one fault jq cannot report: only the
 # date/time anchor and the fixed message, neither of which holds a quote.
 anamnesis_plain_output() {
+    anamnesis_output_begins
     printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"<current-datetime local=\\"%s\\" source=\\"anamnesis\\"/>"}' \
         "$1" "$(date '+%a, %d %b %Y %H:%M:%S %z')"
     [ -z "$2" ] || printf ',"systemMessage":"%s"' "$2"
@@ -1239,11 +1240,24 @@ anamnesis_prompt_deadline() {
     anamnesis_prompt_output "$1" "[]" "$(anamnesis_recall_notice)"
 }
 
+# Called before a hook writes its final stdout: the watchdog is disarmed
+# first, because an ALRM landing while the output pipeline runs would be
+# handled after it, and a second JSON object would follow the first.
+anamnesis_output_begins() {
+    trap '' ALRM
+    ANAMNESIS_ON_DEADLINE=""
+    if [ -n "${ANAMNESIS_WATCHDOG_PID:-}" ]; then
+        kill "$ANAMNESIS_WATCHDOG_PID" 2>/dev/null || :
+        ANAMNESIS_WATCHDOG_PID=""
+    fi
+}
+
 # Usage: anamnesis_prompt_output <hook-event-name> <lines-json> <message>
 # Prints the hook's JSON: the recalled lines (if any) and the date/time
 # anchor as additionalContext, the message, if any, as the systemMessage.
 anamnesis_prompt_output() {
     local event="$1" lines="$2" msg="$3" addl
+    anamnesis_output_begins
     # nature= frames recalled memories as data that passed the pipeline
     # gates, so a payload that slipped through does not read as instructions.
     addl="$(printf '%s' "$lines" | jq -r \
@@ -1258,8 +1272,6 @@ anamnesis_prompt_output() {
     printf '%s' "$addl" | jq -Rs --arg ev "$event" --arg msg "$msg" '
         {hookSpecificOutput: {hookEventName: $ev, additionalContext: .}}
         + (if $msg == "" then {} else {systemMessage: $msg} end)'
-    # The output is out; a watchdog firing now must not print a second.
-    ANAMNESIS_ON_DEADLINE=""
 }
 
 # True when ANAMNESIS_RESPONSE has the shape of a recall answer: an object
