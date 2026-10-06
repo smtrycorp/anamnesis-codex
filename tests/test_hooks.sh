@@ -406,6 +406,10 @@ check "set -e: cleanup done, prior EXIT trap sees the real status" "$(grep -c 'p
 # A worker forked after the parent installed its traps installs its own.
 out="$(bash -c '. "$0"; anamnesis_trap_install; { anamnesis_trap_install; trap -p EXIT; } & wait' "$HOOKS/common.sh")"
 check "a forked worker has its own cleanup trap" "$(grep -c anamnesis_on_exit <<<"$out")" 1
+# A subshell keeps no prior trap: bash 5 shows the parent's traps there
+# though they do not run, and running them would run the parent's cleanup.
+out="$(bash -c '. "$0"; ( anamnesis_trap_command() { [ "$1" = EXIT ] && echo "echo parent-cleanup-ran"; }; anamnesis_trap_install; printf "[%s]" "$ANAMNESIS_PRIOR_TRAP_EXIT" ); echo' "$HOOKS/common.sh")"
+check "a subshell keeps no prior trap" "$out" "[]"
 # Cleanup stops a child that ignores TERM before removing its directory.
 out="$(bash -c '. "$0"; d="$(mktemp -d)"; anamnesis_tmp_guard "$d"; ( trap "" TERM; exec sleep 60 ) & ANAMNESIS_CHILD_PID=$!; c=$ANAMNESIS_CHILD_PID; anamnesis_tmp_cleanup; kill -0 "$c" 2>/dev/null && echo alive || echo dead; [ -d "$d" ] && echo dir || echo nodir' "$HOOKS/common.sh")"
 check "a child deaf to TERM is killed and its directory removed" "$(tr '\n' ' ' <<<"$out")" "dead nodir "

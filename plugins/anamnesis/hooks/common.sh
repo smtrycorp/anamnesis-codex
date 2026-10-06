@@ -436,10 +436,17 @@ anamnesis_tmp_cleanup() {
 anamnesis_trap_install() {
     anamnesis_self_pid || return 0
     [ "$ANAMNESIS_TRAP_OWNER" != "$ANAMNESIS_SELF_PID" ] || return 0
-    ANAMNESIS_PRIOR_TRAP_EXIT="$(anamnesis_trap_command EXIT)"
-    ANAMNESIS_PRIOR_TRAP_INT="$(anamnesis_trap_command INT)"
-    ANAMNESIS_PRIOR_TRAP_TERM="$(anamnesis_trap_command TERM)"
-    ANAMNESIS_PRIOR_TRAP_HUP="$(anamnesis_trap_command HUP)"
+    ANAMNESIS_PRIOR_TRAP_EXIT="" ANAMNESIS_PRIOR_TRAP_INT="" ANAMNESIS_PRIOR_TRAP_TERM="" ANAMNESIS_PRIOR_TRAP_HUP=""
+    # Only the hook's own shell has prior traps to keep. In a subshell bash 5
+    # still shows the parent's traps, though they no longer run there; kept,
+    # they would run the parent's cleanup in the child (a caller's rm of its
+    # own work directory), or this cleanup calling itself.
+    if [ "$ANAMNESIS_SELF_PID" = "$$" ]; then
+        ANAMNESIS_PRIOR_TRAP_EXIT="$(anamnesis_trap_command EXIT)"
+        ANAMNESIS_PRIOR_TRAP_INT="$(anamnesis_trap_command INT)"
+        ANAMNESIS_PRIOR_TRAP_TERM="$(anamnesis_trap_command TERM)"
+        ANAMNESIS_PRIOR_TRAP_HUP="$(anamnesis_trap_command HUP)"
+    fi
     ANAMNESIS_TRAP_OWNER="$ANAMNESIS_SELF_PID"
     trap 'anamnesis_on_exit' EXIT
     anamnesis_trap_signals
