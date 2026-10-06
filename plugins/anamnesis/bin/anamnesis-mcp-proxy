@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 import sys
 import tempfile
@@ -45,6 +46,25 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 # A token response or an error body is a few hundred bytes; anything near
 # this is not one.
 MAX_SMALL_BODY_BYTES = 64 * 1024
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def _client_tag() -> str:
+    """"codex-proxy/<version>" for the X-Anamnesis-Client header on every
+    request, so the server can say which client and version a user runs. The
+    version comes from the plugin manifest, where it is written once, and is
+    read per request because the proxy lives for a whole session while a
+    plugin update can replace the manifest under it. A version that is not a
+    plain version string becomes "0": a CR or LF in it would be a header
+    injection, and http.client refuses one."""
+    try:
+        with open(os.path.join(PLUGIN_ROOT, ".codex-plugin", "plugin.json")) as f:
+            version = json.load(f).get("version")
+    except (OSError, ValueError, AttributeError):
+        version = None
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9A-Za-z._-]{1,40}", version):
+        version = "0"
+    return f"codex-proxy/{version}"
 
 
 class ProxyError(Exception):
@@ -269,7 +289,7 @@ def _refresh(stale_access: str) -> dict:
         req = urllib.request.Request(
             f"{server}/oauth/token",
             data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={"Content-Type": "application/x-www-form-urlencoded", "X-Anamnesis-Client": _client_tag()},
         )
         try:
             with _OPENER.open(req, timeout=TIMEOUT_S) as resp:
@@ -310,7 +330,7 @@ def _send(cfg: dict, message: dict) -> tuple[int, bytes]:
     req = urllib.request.Request(
         f"{server}/mcp",
         data=json.dumps(message).encode(),
-        headers={"Content-Type": "application/json", **auth},
+        headers={"Content-Type": "application/json", "X-Anamnesis-Client": _client_tag(), **auth},
     )
     try:
         with _OPENER.open(req, timeout=TIMEOUT_S) as resp:

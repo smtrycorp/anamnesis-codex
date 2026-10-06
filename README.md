@@ -71,7 +71,7 @@ remove it and run `codex` directly.
 | Hook | When | What it does |
 |------|------|--------------|
 | `SessionStart` | Once per session | Adopts Codex's session id. In the background, replays the pending-upload queue and probes the server. |
-| `UserPromptSubmit` | Before every user turn | Retrieves up to 5 relevant memories and injects them with a `<current-datetime>` anchor (local clock, plus server UTC from the HTTP `Date:` header) as `additionalContext`. Gives up after about 3 seconds so a slow server never holds the prompt. |
+| `UserPromptSubmit` | Before every user turn | Retrieves up to 5 relevant memories and injects them with a `<current-datetime>` anchor (local clock, plus server UTC from the HTTP `Date:` header) as `additionalContext`. Has 8 seconds in all for the recall, token refresh and one retry included, so a slow server never holds the prompt for long, and a recall that fails says so in a one-line `[anamnesis]` notice. |
 | `Stop` | After every turn | In the background, uploads the conversation added to the session's rollout file since the last upload via `log_session`. |
 
 All three are bash scripts that use `curl` + `jq`. No Node, no
@@ -131,10 +131,35 @@ Hooks **never block Codex** and always exit 0. On a server error they
 append a structured entry to `~/.anamnesis/hook_errors.log` and, for an
 upload, queue the payload under `~/.anamnesis/pending_uploads/`. The next
 `SessionStart` replays the queue in the background, stopping at the first
-failure. When the server rejects your sign-in, Codex shows one
-`[anamnesis]` warning line per session until `anamnesis-config` fixes it;
-the MCP proxy returns the same problem as the tool error and logs it to
-stderr.
+failure. A recall that fails is logged with the stage that failed (token refresh,
+request or response parsing), curl's exit code, the HTTP status, the
+seconds it took and the deadline in force, never with a token, a prompt,
+a memory or a response body, and Codex is handed a one-line
+`[anamnesis] recall unavailable this turn (...)` notice on the first
+failure of each kind in a session and again after a recovery. When the
+server rejects your sign-in, that notice says to run `anamnesis-config`
+and the capture hook shows one warning line per session; the MCP proxy
+returns the same problem as the tool error and logs it to stderr.
+
+Every request names the client and version that sent it in an
+`X-Anamnesis-Client` header (`codex/<version>` from the hooks,
+`codex-proxy/<version>` from the proxy), read from this plugin's manifest.
+
+## What changed in 0.2.8
+
+Recall used to give up after 3 seconds and say nothing when it failed; a
+quarter of recalls on a busy account took longer than that, so the prompt
+went out without memories and nobody could tell. The recall now has 8
+seconds in all, retries once when the server was down or not reached, and
+honours a `Retry-After` it can fit in the budget. Every failure is logged
+with its cause and shown once per cause, a dead refresh token included. A
+reply that is not a recall answer counts as a failure, not as an empty
+result. Requests carry an `X-Anamnesis-Client` header.
+`ANAMNESIS_PROMPT_TIMEOUT` now sets the whole recall budget rather than
+one request's cap, and `hooks.json` gives the prompt hook 15 s and session
+start 20 s before Codex may stop them.
+A recall tried a second time carries `attempt: 2` in its request, so the
+server can tell one recall tried twice from two recalls.
 
 ## What's different from the Claude / Gemini versions
 

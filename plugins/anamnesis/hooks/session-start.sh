@@ -17,6 +17,7 @@ ANAMNESIS_SID="$(printf '%s' "$STDIN_JSON" | jq -r '.session_id // empty | strin
 anamnesis_write_session_id "$ANAMNESIS_SID"
 
 anamnesis_start_background_sync
+anamnesis_recall_markers_reset
 anamnesis_gap_notice
 if [ -n "$ANAMNESIS_GAP_CTX" ]; then
     printf '%s' "$ANAMNESIS_GAP_CTX" | jq -Rs '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: .}}'
