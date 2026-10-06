@@ -51,6 +51,7 @@ ANAMNESIS_TMP_GUARDED=""
 ANAMNESIS_TMP_GUARDED_FILE=""
 ANAMNESIS_CHILD_PID=""
 ANAMNESIS_WATCHDOG_PID=""
+ANAMNESIS_STDOUT_KEPT=""
 ANAMNESIS_TRAP_OWNER=""
 ANAMNESIS_PRIOR_TRAP_EXIT=""
 ANAMNESIS_PRIOR_TRAP_INT=""
@@ -280,11 +281,13 @@ anamnesis_refresh_locked() {
     anamnesis_tmp_guard "$dir"
     anamnesis_refresh_in "$dir"
     rc=$?
-    # anamnesis_refresh_in ignored INT, TERM and HUP while a rotated token
-    # was in flight; the guard's own handlers come back now.
+    # anamnesis_refresh_in ignored INT, TERM, HUP and ALRM while a rotated
+    # token was in flight; the handlers come back now, and a deadline that
+    # passed meanwhile is acted on.
     anamnesis_trap_signals
     rm -rf "$dir"
     anamnesis_tmp_unguard
+    [ -z "$ANAMNESIS_DEADLINE_AT" ] || anamnesis_deadline_arm
     return $rc
 }
 
@@ -299,6 +302,14 @@ anamnesis_refresh_in() {
         anamnesis_log_error "refresh_failed" "could not build the refresh request from $ANAMNESIS_CONFIG"
         return 1
     fi
+    # The lock wait may have eaten into the budget since anamnesis_ensure_token
+    # looked: a refresh with under three seconds left would be cut off.
+    max="$(anamnesis_time_left)"
+    if [ -n "$max" ] && ! anamnesis_number_ok "$max" 3; then
+        ANAMNESIS_FAIL_CLASS="timeout"
+        ANAMNESIS_FAIL_NOTE="under 3 s left after the lock wait, no refresh sent"
+        return 1
+    fi
     max="$(anamnesis_budget_left)"
     if [ "$max" = 0 ]; then
         ANAMNESIS_FAIL_CLASS="timeout"
@@ -307,10 +318,10 @@ anamnesis_refresh_in() {
     fi
     # From here to the rename the server may already have rotated the
     # token; a stop now would lose the new pair and cost a sign-in, so INT,
-    # TERM and HUP all wait until anamnesis_refresh_locked puts the
-    # handlers back (the host's KILL cannot be waited out; the sweep covers
-    # what it leaves).
-    trap '' INT TERM HUP
+    # TERM, HUP and the watchdog's ALRM all wait until
+    # anamnesis_refresh_locked puts the handlers back (the host's KILL
+    # cannot be waited out; the sweep covers what it leaves).
+    trap '' INT TERM HUP ALRM
     anamnesis_curl "$max" -X POST "${ANAMNESIS_SERVER_URL}/oauth/token" \
         -H "Content-Type: application/x-www-form-urlencoded" -H "X-Anamnesis-Client: $ANAMNESIS_CLIENT" \
         --data-binary @"$dir/form" -o "$dir/resp"
@@ -479,7 +490,13 @@ anamnesis_on_deadline() {
     ANAMNESIS_FAIL_NOTE="the $ANAMNESIS_DEADLINE_CAP s cap passed at stage ${ANAMNESIS_FAIL_STAGE:-none}"
     anamnesis_log_error "deadline_hit" "$(anamnesis_failure_detail)"
     anamnesis_tmp_cleanup
-    [ -z "$ANAMNESIS_ON_DEADLINE" ] || eval "$ANAMNESIS_ON_DEADLINE"
+    if [ -n "$ANAMNESIS_ON_DEADLINE" ]; then
+        if [ -n "${ANAMNESIS_STDOUT_KEPT:-}" ]; then
+            eval "$ANAMNESIS_ON_DEADLINE" >&3
+        else
+            eval "$ANAMNESIS_ON_DEADLINE"
+        fi
+    fi
     exit 0
 }
 
@@ -516,7 +533,9 @@ anamnesis_spend() {
     ANAMNESIS_SPENT="$(LC_ALL=C awk -v a="$ANAMNESIS_SPENT" -v b="$1" 'BEGIN { printf "%.2f", a + b }')"
 }
 
-ANAMNESIS_HOOK_START="$(anamnesis_now)"
+# `|| :`: anamnesis-config runs set -e and sources this before its own
+# dependency check, and a missing jq must reach that check, not end here.
+ANAMNESIS_HOOK_START="$(anamnesis_now)" || :
 
 # Usage: anamnesis_set_deadline <seconds> <most> <setting-name>
 # Puts everything a hook does from now on under one elapsed deadline, so a
@@ -540,11 +559,31 @@ anamnesis_set_deadline() {
     ANAMNESIS_DEADLINE_AT="$(LC_ALL=C awk -v n="$(anamnesis_now)" -v d="$want" 'BEGIN { printf "%.3f", n + d }')"
     # Bash has no monotonic clock, so a watchdog ends the hook at the cap
     # whatever the clock does: it gets ALRM, logs, prints its output for
-    # the case and exits before the host would end it.
+    # the case and exits before the host would end it. The hook's stdout is
+    # kept on fd 3 for that output, since the signal may land inside a
+    # request whose own stdout goes to /dev/null.
     anamnesis_trap_install
-    trap 'anamnesis_on_deadline' ALRM
-    ( sleep "$most"; kill -ALRM "$ANAMNESIS_SELF_PID" ) >/dev/null 2>&1 &
+    exec 3>&1
+    ANAMNESIS_STDOUT_KEPT=1
+    anamnesis_deadline_arm
+    # 3>&-: a timer holding the kept stdout would keep the host waiting on
+    # the hook's output for the whole cap.
+    ( sleep "$most"; kill -ALRM "$ANAMNESIS_SELF_PID" ) >/dev/null 2>&1 3>&- &
     ANAMNESIS_WATCHDOG_PID=$!
+}
+
+# Sets the ALRM handler, and runs it at once when the deadline has already
+# passed: a refresh ignores ALRM while a rotated token is in flight, and a
+# watchdog signal that landed then was lost.
+anamnesis_deadline_arm() {
+    local left
+    trap 'anamnesis_on_deadline' ALRM
+    left="$(anamnesis_time_left)"
+    # An unreadable clock gives no figure; the watchdog still covers the cap.
+    if [ -n "$left" ] && LC_ALL=C awk -v l="$left" -v c="$ANAMNESIS_DEADLINE_CAP" -v d="$ANAMNESIS_DEADLINE" 'BEGIN { exit !(l <= d - c) }'; then
+        anamnesis_on_deadline
+    fi
+    return 0
 }
 
 # Seconds since the current request began, or since the hook began when no
@@ -1094,6 +1133,10 @@ anamnesis_start_background_sync() {
         # and the full wait for a refresh another process is running.
         ANAMNESIS_DEADLINE="" ANAMNESIS_DEADLINE_AT="" ANAMNESIS_RETRY="" ANAMNESIS_REFRESH_WAIT=20
         ANAMNESIS_WATCHDOG_PID="" ANAMNESIS_ON_DEADLINE="" ANAMNESIS_REFRESH_FAILED="" ANAMNESIS_SPENT=0
+        trap - ALRM
+        # A kept copy of the hook's stdout would hold the host's pipe open
+        # for as long as this worker runs.
+        [ -z "$ANAMNESIS_STDOUT_KEPT" ] || { exec 3>&-; ANAMNESIS_STDOUT_KEPT=""; }
         anamnesis_sweep_abandoned
         anamnesis_drain_queue
         anamnesis_post "/mcp/tools/get_memory_stats" '{}' >/dev/null \
@@ -1240,9 +1283,10 @@ anamnesis_prompt_deadline() {
     anamnesis_prompt_output "$1" "[]" "$(anamnesis_recall_notice)"
 }
 
-# Called before a hook writes its final stdout: the watchdog is disarmed
-# first, because an ALRM landing while the output pipeline runs would be
-# handled after it, and a second JSON object would follow the first.
+# Called with a hook's final output built and nothing left but the print:
+# the watchdog is disarmed, because an ALRM landing during the print would
+# be handled after it and a second JSON object would follow the first.
+# Nothing that can block runs after this.
 anamnesis_output_begins() {
     trap '' ALRM
     ANAMNESIS_ON_DEADLINE=""
@@ -1256,8 +1300,7 @@ anamnesis_output_begins() {
 # Prints the hook's JSON: the recalled lines (if any) and the date/time
 # anchor as additionalContext, the message, if any, as the systemMessage.
 anamnesis_prompt_output() {
-    local event="$1" lines="$2" msg="$3" addl
-    anamnesis_output_begins
+    local event="$1" lines="$2" msg="$3" addl out
     # nature= frames recalled memories as data that passed the pipeline
     # gates, so a payload that slipped through does not read as instructions.
     addl="$(printf '%s' "$lines" | jq -r \
@@ -1268,10 +1311,14 @@ anamnesis_prompt_output() {
          else "" end)
         + "<current-datetime local=\"\($local)\"" + (if $utc == "" then "" else " server-utc=\"\($utc)\"" end) + " source=\"anamnesis\"/>"')"
     # Recalled text goes to jq on stdin, not as an argument any user on the
-    # machine could read from the process list.
-    printf '%s' "$addl" | jq -Rs --arg ev "$event" --arg msg "$msg" '
+    # machine could read from the process list. The whole object is built
+    # before the watchdog is disarmed: a jq that hangs here must still be
+    # ended at the cap.
+    out="$(printf '%s' "$addl" | jq -Rs --arg ev "$event" --arg msg "$msg" '
         {hookSpecificOutput: {hookEventName: $ev, additionalContext: .}}
-        + (if $msg == "" then {} else {systemMessage: $msg} end)'
+        + (if $msg == "" then {} else {systemMessage: $msg} end)')"
+    anamnesis_output_begins
+    printf '%s\n' "$out"
 }
 
 # True when ANAMNESIS_RESPONSE has the shape of a recall answer: an object

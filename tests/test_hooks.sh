@@ -469,7 +469,49 @@ victim=$!
 sleep 1
 kill -ALRM "$victim"
 wait "$victim"
-check "a watchdog signal during output leaves exactly one JSON object" "$? $(jq -c . "$WORK/alrm.out" | wc -l | tr -d ' ') $(jq -r '.hookSpecificOutput.additionalContext' "$WORK/alrm.out" | grep -c 'the blue door')" "0 1 1"
+check "a watchdog signal while the output is built ends the hook with the deadline output, once" "$? $(jq -c . "$WORK/alrm.out" | wc -l | tr -d ' ') $(jq -r '.systemMessage' "$WORK/alrm.out" | grep -c 'timed out')" "0 1 1"
 routes '{}'
+
+
+# Review round 6.
+# The watchdog's output reaches the hook's stdout even when the signal lands
+# inside a request whose own stdout is /dev/null.
+new_home
+out="$(bash -c '. "$0"; anamnesis_load_config; ANAMNESIS_SID=s; anamnesis_set_deadline 0.5 0.5 X; ANAMNESIS_ON_DEADLINE="anamnesis_prompt_deadline UserPromptSubmit"; anamnesis_pause 2 >/dev/null; echo not-reached' "$HOOKS/common.sh")"
+check "deadline output survives a redirected request" "$? $(jq -c . <<<"$out" | wc -l | tr -d ' ') $(jq -r .systemMessage <<<"$out" | grep -c 'timed out') $(grep -c not-reached <<<"$out")" "0 1 1 0"
+
+# A refresh keeps its rotated token through a watchdog signal, and the
+# deadline is acted on once the token is safe.
+new_home
+jq '.expires_at = 0' "$ANAMNESIS_HOME/config.json" > "$ANAMNESIS_HOME/config.tmp" && mv "$ANAMNESIS_HOME/config.tmp" "$ANAMNESIS_HOME/config.json"
+echo '{"refresh_token": "rt0"}' > "$SRV/oauth.json"
+mkdir -p "$WORK/slowpersist"
+printf '#!/bin/sh\ncase "$*" in *--slurpfile\\ r*) sleep 5 ;; esac\nexec /usr/bin/jq "$@"\n' > "$WORK/slowpersist/jq"
+chmod +x "$WORK/slowpersist/jq"
+PATH="$WORK/slowpersist:$PATH" bash -c '. "$0"; anamnesis_load_config; ANAMNESIS_SID=s; anamnesis_set_deadline 4 4 X; anamnesis_ensure_token; echo not-reached' "$HOOKS/common.sh" > "$WORK/persist.out"
+check "a rotated token is kept through the watchdog, then the deadline is acted on" "$? $(jq -r '.access_token + " " + .refresh_token' "$ANAMNESIS_HOME/config.json") $(grep -c deadline_hit "$ANAMNESIS_HOME/hook_errors.log") $(grep -c not-reached "$WORK/persist.out")" "0 at1 rt1 1 0"
+
+# The three-second floor is checked again after the lock wait.
+new_home
+jq '.expires_at = 0' "$ANAMNESIS_HOME/config.json" > "$ANAMNESIS_HOME/config.tmp" && mv "$ANAMNESIS_HOME/config.tmp" "$ANAMNESIS_HOME/config.json"
+echo '{"refresh_token": "rt0"}' > "$SRV/oauth.json"
+sleep 5 &
+holder=$!
+ln -s "$holder" "$ANAMNESIS_HOME/refresh.lck"
+( sleep 0.7; rm -f "$ANAMNESIS_HOME/refresh.lck" ) &
+note="$(bash -c '. "$0"; anamnesis_load_config; anamnesis_set_deadline 3.5 12 X; ANAMNESIS_REFRESH_WAIT=4; anamnesis_ensure_token; printf "%s" "$ANAMNESIS_FAIL_NOTE"' "$HOOKS/common.sh")"
+check "a refresh is not sent with under 3 s left after the lock wait" "$(count_req oauth/token) $note" "0 under 3 s left after the lock wait, no refresh sent"
+kill "$holder" 2>/dev/null
+
+# anamnesis-config reaches its own diagnostics and --help without jq.
+mkdir -p "$WORK/nojq127"
+printf '#!/bin/sh\nexit 127\n' > "$WORK/nojq127/jq"
+chmod +x "$WORK/nojq127/jq"
+check "anamnesis-config --help works without jq" "$(PATH="$WORK/nojq127:$PATH" plugins/anamnesis/bin/anamnesis-config --help 2>&1 | grep -q 'anamnesis-config' && echo ok)" ok
+check "anamnesis-config names the missing tool" "$(PATH="$WORK/nojq127:$PATH" plugins/anamnesis/bin/anamnesis-config --server "$URL" 2>&1 | grep -c 'missing required tool: jq')" 1
+
+# An unreadable clock does not end the hook when the deadline is re-armed.
+out="$(bash -c '. "$0"; anamnesis_time_left() { :; }; ANAMNESIS_DEADLINE=8 ANAMNESIS_DEADLINE_CAP=12; anamnesis_deadline_arm; echo still-running' "$HOOKS/common.sh")"
+check "re-arming with no clock figure leaves the hook running" "$out" "still-running"
 
 exit $fail

@@ -61,8 +61,9 @@ fi
 # --- dependency check ---
 # curl + jq are always needed. python3 is needed for OAuth (interactive
 # mode only); scripted mode can skip the check.
+# A tool that is on PATH but does not run is as missing as one that is not.
 for dep in curl jq; do
-    if ! command -v "$dep" >/dev/null 2>&1; then
+    if ! command -v "$dep" >/dev/null 2>&1 || ! "$dep" --version >/dev/null 2>&1; then
         echo "anamnesis-config: missing required tool: $dep" >&2
         echo "  install via:  brew install $dep   (macOS)  or  apt-get install $dep" >&2
         exit 2
