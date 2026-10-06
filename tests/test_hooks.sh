@@ -479,6 +479,14 @@ sleep 0.5
 kill -KILL "$victim"
 sleep 0.8
 check "a hook killed outright still has its work stopped" "$(pgrep -f "sleep 36\\.$n" | wc -l | tr -d ' ')" 0
+# Killed just before its limit, while the timer may still see it: the work
+# is stopped all the same.
+bash -c '. "$0"; n="$1"; w() { sleep "38.$n"; }; anamnesis_supervise X 1 "late" "" w' "$HOOKS/common.sh" "$n" > /dev/null &
+victim=$!
+sleep 0.9
+kill -KILL "$victim"
+sleep 0.8
+check "a hook killed at its limit still has its work stopped" "$(pgrep -f "sleep 38\\.$n" | wc -l | tr -d ' ')" 0
 # The output is staged where no other account can read it, whatever the
 # host's umask.
 out="$(umask 022; bash -c '. "$0"; w() { ls -ld "$ANAMNESIS_SUPERVISED_DIR" | cut -c1-10 >&7; printf "{}\n"; }; anamnesis_supervise X 5 "late" "failed" w 7>"$1"' "$HOOKS/common.sh" "$WORK/perm.out"; cat "$WORK/perm.out")"
@@ -497,7 +505,11 @@ new_home
 out="$(PATH="$WORK/jq127:$PATH" bash -c '. "$0"; w() { printf "{\"hookSpecificOutput\":"; }; anamnesis_supervise UserPromptSubmit 5 "late" "[anamnesis] failed" w' "$HOOKS/common.sh")"
 check "unchecked output is not passed on" "$(/usr/bin/jq -r .systemMessage <<<"$out") $(grep -c 'no jq to check' "$ANAMNESIS_HOME/hook_errors.log")" "[anamnesis] failed 1"
 out="$(PATH="$WORK/jq127:$PATH" bash -c '. "$0"; w() { anamnesis_plain_output UserPromptSubmit "jq and curl must \"both\" be on PATH"; }; anamnesis_supervise UserPromptSubmit 5 "late" "failed" w' "$HOOKS/common.sh")"
-check "a handed-over notice is printed by the supervisor, quotes removed" "$(/usr/bin/jq -r .systemMessage <<<"$out")" "jq and curl must both be on PATH"
+check "a handed-over notice is printed by the supervisor, quotes kept" "$(/usr/bin/jq -r .systemMessage <<<"$out")" "jq and curl must \"both\" be on PATH"
+for m in 'first|second' '|second' 'first	second' 'bell'; do
+    out="$(PATH="$WORK/jq127:$PATH" bash -c '. "$0"; w() { anamnesis_plain_output X "$(printf "%s" "$1" | tr "|" "\n")"; }; anamnesis_supervise X 5 "late" "failed" w "$1"' "$HOOKS/common.sh" "$m")"
+    check "a notice with control characters ($m) stays valid JSON, whole" "$(/usr/bin/jq -r '.systemMessage // "none"' <<<"$out" | tr '\n' '|')" "$m|"
+done
 # A clock that cannot be read leaves a fixed word in the late notice, and
 # the late path calls nothing more.
 mkdir -p "$WORK/nodate"
@@ -505,7 +517,7 @@ printf '#!/bin/sh\nsleep 3; exit 1\n' > "$WORK/nodate/date"
 chmod +x "$WORK/nodate/date"
 start=$SECONDS
 out="$(PATH="$WORK/nodate:$PATH" bash -c '. "$0"; w() { sleep 20; }; anamnesis_supervise UserPromptSubmit 1 "[anamnesis] stopped" "" w' "$HOOKS/common.sh")"
-check "a clock that cannot be read: late notice on time, fixed time word" "$([ $((SECONDS - start)) -le 8 ] && echo bounded) $(jq -r .hookSpecificOutput.additionalContext <<<"$out" | grep -c 'time unavailable')" "bounded 1"
+check "a clock that cannot be read: late notice on time, fixed time word" "$([ $((SECONDS - start)) -le 2 ] && echo bounded) $(jq -r .hookSpecificOutput.additionalContext <<<"$out" | grep -c 'time unavailable')" "bounded 1"
 # The sweep takes old supervisor directories only, nothing else with the
 # same prefix.
 new_home
