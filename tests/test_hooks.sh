@@ -172,7 +172,7 @@ start=$SECONDS
 out="$(recall s)"
 check "prompt returns within the 8 s budget" "$([ $((SECONDS - start)) -le 10 ] && echo fast)" fast
 check "time anchor survives a timeout" "$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -c '<current-datetime')" 1
-check "timeout: the user is told" "$(jq -r '.systemMessage' <<<"$out")" '[anamnesis] recall unavailable this turn (timed out after 8 s)'
+check "timeout: the user is told, with the time it took" "$(jq -r '.systemMessage' <<<"$out" | grep -c '^\[anamnesis\] recall unavailable this turn (timed out after [78]\.[0-9] s of the 8 s budget)$')" 1
 check "timeout: logged with curl exit, status, time and deadline" "$(last_failure | grep -c '^request: curl exit 28, HTTP 000, [78]\.[0-9]* s against the 8 s deadline, 1 attempt$')" 1
 routes "{\"/mcp/tools/retrieve_memories\": {\"delay\": 4, \"body\": $HIT}}"
 out="$(recall s)"
@@ -306,13 +306,15 @@ sleep 1
 kill -KILL "$victim" 2>/dev/null
 wait "$victim" 2>/dev/null
 sleep 0.5
-check "a stopped request leaves no directory and no curl" "$(ls "$WORK/tmp2.$$" | grep -c anamnesis) $(pgrep -f "retrieve_memories" | wc -l | tr -d ' ') $(wc -c < "$WORK/killed2.out" | tr -d ' ')" "0 0 0"
+check "a stopped request leaves no directory and no curl" "$(ls "$WORK/tmp2.$$" | grep -c anamnesis) $(pgrep -f "${URL#http://}/mcp/tools/retrieve_memories" | wc -l | tr -d ' ') $(wc -c < "$WORK/killed2.out" | tr -d ' ')" "0 0 0"
 routes '{}'
-mkdir -p "$WORK/tmp3.$$/anamnesis.oldabc" "$WORK/tmp3.$$/anamnesis.newabc"
-touch -t 202001010000 "$WORK/tmp3.$$/anamnesis.oldabc" "$ANAMNESIS_HOME/config.json.oldabc"
+mkdir -p "$WORK/tmp3.$$/anamnesis.oldabc" "$WORK/tmp3.$$/anamnesis.newabc" "$WORK/tmp3.$$/anamnesis.oldliv"
+echo "$$" > "$WORK/tmp3.$$/anamnesis.oldliv/pid"
+echo 999999 > "$WORK/tmp3.$$/anamnesis.oldabc/pid"
+touch -t 202001010000 "$WORK/tmp3.$$/anamnesis.oldabc" "$WORK/tmp3.$$/anamnesis.oldliv" "$ANAMNESIS_HOME/config.json.oldabc"
 echo '{"session_id":"s"}' | TMPDIR="$WORK/tmp3.$$" "$HOOKS/session-start.sh" >/dev/null
 sleep 1
-check "session start sweeps what a kill left behind, and nothing in flight" "$(ls "$WORK/tmp3.$$" | tr '\n' ' ')$([ -e "$ANAMNESIS_HOME/config.json.oldabc" ] && echo kept || echo gone)" "anamnesis.newabc gone"
+check "session start sweeps what a kill left behind, not what is in flight or owned by a live process" "$(ls "$WORK/tmp3.$$" | tr '\n' ' ')$([ -e "$ANAMNESIS_HOME/config.json.oldabc" ] && echo kept || echo gone)" "anamnesis.newabc anamnesis.oldliv gone"
 
 # The budget is an elapsed deadline, cut to what the host leaves, and the
 # setting is validated like the per-request cap.
@@ -354,8 +356,10 @@ check "a refresh failure leaves the queue as it was" "$(ls "$ANAMNESIS_HOME/pend
 # A lock that cannot be made is a local fault, not another process.
 new_home
 jq '.expires_at = 0' "$ANAMNESIS_HOME/config.json" > "$ANAMNESIS_HOME/config.tmp" && mv "$ANAMNESIS_HOME/config.tmp" "$ANAMNESIS_HOME/config.json"
+mkdir -p "$ANAMNESIS_HOME/receipt_state"
 chmod 500 "$ANAMNESIS_HOME"
-check "an unwritable home is told as a local error" "$(notice s)" "[anamnesis] recall unavailable this turn (local error, see hook_errors.log)"
+start=$SECONDS
+check "an unwritable home is told as a local error, without a long wait" "$(notice s) $([ $((SECONDS - start)) -le 2 ] && echo quick)" "[anamnesis] recall unavailable this turn (local error, see hook_errors.log) quick"
 chmod 700 "$ANAMNESIS_HOME"
 
 # A success forgets every failure told, so the same kind is news again.
@@ -384,5 +388,73 @@ check "no config at all stays quiet" "$(recall s)" ""
 new_home
 out="$(bash -c '. "$0"; trap "echo prior-trap-ran" EXIT; anamnesis_load_config; anamnesis_post /mcp/tools/get_memory_stats "{}" >/dev/null' "$HOOKS/common.sh")"
 check "a prior trap is kept, not replaced" "$(grep -c prior-trap-ran <<<"$out")" 1
+
+
+# Review round 4.
+# A trap set before the guard still runs on a signal, and the shell exits 0.
+for sig in TERM INT HUP; do
+    out="$(bash -c '. "$0"; trap "echo prior-$1-ran" "$1"; d="$(mktemp -d)"; anamnesis_tmp_guard "$d"; kill -"$1" "$ANAMNESIS_SELF_PID"; echo not-reached' "$HOOKS/common.sh" "$sig")"
+    check "a prior $sig trap is kept and the hook exits 0" "$? $(grep -c "prior-$sig-ran" <<<"$out") $(grep -c not-reached <<<"$out")" "0 1 0"
+done
+# Under set -e a failed request still cleans up, and the prior EXIT trap
+# sees the status the shell was exiting with.
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"status": 503}}'
+mkdir -p "$WORK/tmp4.$$"
+out="$(TMPDIR="$WORK/tmp4.$$" bash -c 'set -e; . "$0"; trap "echo prior-exit rc=\$?" EXIT; anamnesis_load_config; anamnesis_post /mcp/tools/retrieve_memories "{}" >/dev/null' "$HOOKS/common.sh")"
+check "set -e: cleanup done, prior EXIT trap sees the real status" "$(grep -c 'prior-exit rc=1' <<<"$out") $(ls "$WORK/tmp4.$$" | grep -c anamnesis)" "1 0"
+# A worker forked after the parent installed its traps installs its own.
+out="$(bash -c '. "$0"; anamnesis_trap_install; { anamnesis_trap_install; trap -p EXIT; } & wait' "$HOOKS/common.sh")"
+check "a forked worker has its own cleanup trap" "$(grep -c anamnesis_on_exit <<<"$out")" 1
+# Cleanup stops a child that ignores TERM before removing its directory.
+out="$(bash -c '. "$0"; d="$(mktemp -d)"; anamnesis_tmp_guard "$d"; ( trap "" TERM; exec sleep 60 ) & ANAMNESIS_CHILD_PID=$!; c=$ANAMNESIS_CHILD_PID; anamnesis_tmp_cleanup; kill -0 "$c" 2>/dev/null && echo alive || echo dead; [ -d "$d" ] && echo dir || echo nodir' "$HOOKS/common.sh")"
+check "a child deaf to TERM is killed and its directory removed" "$(tr '\n' ' ' <<<"$out")" "dead nodir "
+routes '{}'
+
+# Without a working jq the hook stays silent when nothing is set up, and
+# the one notice jq cannot build is built without it.
+new_home
+rm -f "$ANAMNESIS_HOME/config.json"
+mkdir -p "$WORK/brokenjq"
+printf '#!/bin/sh\necho "jq: command not found" >&2\nexit 127\n' > "$WORK/brokenjq/jq"
+chmod +x "$WORK/brokenjq/jq"
+check "no config and no jq: nothing on stdout or stderr" "$(echo '{"prompt":"q"}' | PATH="$WORK/brokenjq:$PATH" "$HOOKS/user-prompt-submit.sh" 2>&1 | wc -c | tr -d ' ')" 0
+check "the jq-less notice is valid hook JSON" "$(bash -c '. "$0"; anamnesis_plain_output UserPromptSubmit "jq and curl must both be on PATH"' "$HOOKS/common.sh" | jq -r '.systemMessage + " " + (.hookSpecificOutput.additionalContext | test("<current-datetime") | tostring)')" "jq and curl must both be on PATH true"
+
+# A clock that steps backwards hands out no time, and the watchdog ends the
+# hook at the cap whatever the clock says.
+new_home
+echo 100 > "$WORK/clock"
+out="$(ANAMNESIS_TEST_CLOCK="$WORK/clock" bash -c '. "$0"; anamnesis_set_deadline 8 12 X; echo 40 > "$1"; ANAMNESIS_RETRY=1; ANAMNESIS_ATTEMPTS=1; ANAMNESIS_CURL_EXIT=0; ANAMNESIS_STATUS=503; printf "Retry-After: 60\r\n" > "$1.h"; anamnesis_retry_due "$1.h" && echo retry || echo no-retry; anamnesis_time_left' "$HOOKS/common.sh" "$WORK/clock")"
+check "a clock step back grants no retry" "$(head -1 <<<"$out") $(tail -1 <<<"$out" | LC_ALL=C awk '{ print ($1 <= 8) ? "bounded" : "unbounded" }')" "no-retry bounded"
+start=$SECONDS
+out="$(bash -c '. "$0"; anamnesis_set_deadline 1 1 X; ANAMNESIS_ON_DEADLINE="echo watchdog-fired"; anamnesis_pause 10; echo not-reached' "$HOOKS/common.sh")"
+check "the watchdog ends the hook at the cap" "$? $(tr '\n' ' ' <<<"$out") $([ $((SECONDS - start)) -le 4 ] && echo quick) $(grep -c deadline_hit "$ANAMNESIS_HOME/hook_errors.log")" "0 watchdog-fired  quick 1"
+
+# One refresh per process, and none with under three seconds left.
+new_home
+jq '.expires_at = 0' "$ANAMNESIS_HOME/config.json" > "$ANAMNESIS_HOME/config.tmp" && mv "$ANAMNESIS_HOME/config.tmp" "$ANAMNESIS_HOME/config.json"
+out="$(ANAMNESIS_PROMPT_TIMEOUT=2 recall s)"
+check "a short budget starts no refresh" "$(count_req oauth/token) $(jq -r .systemMessage <<<"$out" | grep -c 'timed out after') $(last_failure | grep -c 'under 3 s left, no refresh started')" "0 1 1"
+
+# A receipt store that cannot be written holds notices back and says so once.
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"status": 503}}'
+mkdir -p "$ANAMNESIS_HOME/receipt_state"
+chmod 500 "$ANAMNESIS_HOME/receipt_state"
+check "unwritable receipts: no notice, logged once per hook run" "$(notice s)|$(notice s)|$(grep -c receipt_store_unwritable "$ANAMNESIS_HOME/hook_errors.log")" "||2"
+chmod 700 "$ANAMNESIS_HOME/receipt_state"
+routes '{}'
+
+# A retry names its attempt; a note from attempt 1 does not outlive it.
+new_home
+routes "{\"/mcp/tools/retrieve_memories\": {\"status\": 503, \"then\": {\"body\": $HIT}}}"
+recall s >/dev/null
+check "the retry carries attempt 2, the first attempt none" "$(grep retrieve_memories "$SRV/requests" | jq -r '.body | fromjson | .attempt // "none"' | tr '\n' ' ')" "none 2 "
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"status": 503, "headers": {"Retry-After": "1"}, "then": {"status": 500}}}'
+notice s >/dev/null
+check "a Retry-After from attempt 1 is not logged against attempt 2" "$(last_failure | grep -c 'HTTP 500, .* 2 attempts$') $(last_failure | grep -c Retry-After)" "1 0"
+routes '{}'
 
 exit $fail

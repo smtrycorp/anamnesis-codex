@@ -14,11 +14,14 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # still be reported; the wait for another process's refresh is two
 # half-second ticks.
 ANAMNESIS_STDIN="$(cat)"
-anamnesis_resolve_sid "$ANAMNESIS_STDIN"
-anamnesis_set_deadline "${ANAMNESIS_PROMPT_TIMEOUT:-8}" 12 ANAMNESIS_PROMPT_TIMEOUT
-ANAMNESIS_RETRY=1
-ANAMNESIS_REFRESH_WAIT=2
+# The config is read before anything else runs: with jq missing or nothing
+# set up, the hook must stay as quiet as it always was.
 if anamnesis_load_config; then
+    anamnesis_resolve_sid "$ANAMNESIS_STDIN"
+    anamnesis_set_deadline "${ANAMNESIS_PROMPT_TIMEOUT:-8}" 12 ANAMNESIS_PROMPT_TIMEOUT
+    ANAMNESIS_RETRY=1
+    ANAMNESIS_REFRESH_WAIT=2
+    ANAMNESIS_ON_DEADLINE="anamnesis_prompt_deadline UserPromptSubmit"
     anamnesis_prompt_hook "UserPromptSubmit" no
 else
     anamnesis_config_fault_hook "UserPromptSubmit"

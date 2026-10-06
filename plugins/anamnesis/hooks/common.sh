@@ -37,19 +37,36 @@ ANAMNESIS_REFRESH_WAIT="${ANAMNESIS_REFRESH_WAIT:-20}"
 # send it twice. Empty means one attempt capped by ANAMNESIS_CURL_TIMEOUT.
 ANAMNESIS_DEADLINE=""
 ANAMNESIS_DEADLINE_AT=""
+ANAMNESIS_DEADLINE_CAP=""
 ANAMNESIS_RETRY=""
 # Settings that had to be replaced, logged once per session at the first
 # request (the session is not known this early).
 ANAMNESIS_SETTING_NOTES=""
 # What the cleanup traps remove on a stop: the request's directory, a
-# config.json temp from a refresh, and the curl or sleep being waited on.
+# config.json temp from a refresh, the curl or sleep being waited on, and
+# the watchdog that fires at the hook's cap. ANAMNESIS_TRAP_OWNER is the
+# PID of the shell whose traps these are: a forked worker inherits the
+# variables but not the handlers, so it installs its own.
 ANAMNESIS_TMP_GUARDED=""
 ANAMNESIS_TMP_GUARDED_FILE=""
 ANAMNESIS_CHILD_PID=""
+ANAMNESIS_WATCHDOG_PID=""
+ANAMNESIS_TRAP_OWNER=""
 ANAMNESIS_PRIOR_TRAP_EXIT=""
 ANAMNESIS_PRIOR_TRAP_INT=""
 ANAMNESIS_PRIOR_TRAP_TERM=""
 ANAMNESIS_PRIOR_TRAP_HUP=""
+# What a prompt hook prints if the watchdog ends it (anamnesis_on_deadline).
+ANAMNESIS_ON_DEADLINE=""
+# Seconds this hook has itself accounted for (curl times, waits, lock
+# ticks): the floor under the clock, which can step backwards.
+ANAMNESIS_SPENT=0
+# A refresh that failed is not tried again by this process; the worker it
+# forks starts afresh.
+ANAMNESIS_REFRESH_FAILED=""
+ANAMNESIS_REFRESH_FAIL_CLASS=""
+ANAMNESIS_REFRESH_FAIL_NOTE=""
+ANAMNESIS_RECEIPTS_UNWRITABLE=""
 ANAMNESIS_SID=""
 ANAMNESIS_RESPONSE=""
 ANAMNESIS_SERVER_TIME=""
@@ -198,15 +215,34 @@ anamnesis_token_fresh() {
 anamnesis_ensure_token() {
     [ "${ANAMNESIS_AUTH_MODE:-}" = "oauth" ] || return 0
     anamnesis_token_fresh && return 0
-    local lock="$ANAMNESIS_HOME/refresh.lck" rc=0 holder
-    if ! anamnesis_lock_acquire "$lock" "$ANAMNESIS_REFRESH_WAIT"; then
-        # Busy only when a live process holds the lock; a lock that cannot
-        # be taken for want of a PID or a writable directory is a local
-        # fault, and saying another process held it would send the user
-        # looking for one.
+    local lock="$ANAMNESIS_HOME/refresh.lck" rc=0 holder left ticks="$ANAMNESIS_REFRESH_WAIT"
+    # One refresh per process: a second try after a timeout could send a
+    # refresh token the server has already rotated out, and that costs the
+    # user a sign-in. The worker this process forks starts afresh.
+    if [ -n "$ANAMNESIS_REFRESH_FAILED" ]; then
+        ANAMNESIS_FAIL_CLASS="$ANAMNESIS_REFRESH_FAIL_CLASS"
+        ANAMNESIS_FAIL_NOTE="${ANAMNESIS_REFRESH_FAIL_NOTE:+$ANAMNESIS_REFRESH_FAIL_NOTE; }the refresh already failed once this run"
+        return 1
+    fi
+    # A refresh wants a lock wait and a round trip; with under three
+    # seconds left it would only be cut off, so it is left to the worker.
+    left="$(anamnesis_time_left)"
+    if [ -n "$left" ] && ! anamnesis_number_ok "$left" 3; then
+        ANAMNESIS_FAIL_CLASS="timeout"
+        ANAMNESIS_FAIL_NOTE="under 3 s left, no refresh started"
+        return 1
+    fi
+    [ -z "$left" ] || ticks="$(LC_ALL=C awk -v t="$ticks" -v l="$left" 'BEGIN { m = int(l * 2); print (m < t) ? m : t }')"
+    if ! anamnesis_lock_acquire "$lock" "$ticks"; then
+        anamnesis_spend "$(LC_ALL=C awk -v t="$ANAMNESIS_LOCK_WAITED" 'BEGIN { printf "%.1f", t / 2 }')"
+        # Busy when a live process holds the lock, or held it and has let go
+        # since; a lock that cannot be taken for want of a PID or a writable
+        # directory is a local fault, and saying another process held it
+        # would send the user looking for one.
         holder="$(readlink "$lock" 2>/dev/null)"
         case "$holder" in
-            ''|*[!0-9]*) ANAMNESIS_FAIL_CLASS="local" ;;
+            '') if [ -n "${ANAMNESIS_SELF_PID:-}" ] && [ -w "$ANAMNESIS_HOME" ]; then ANAMNESIS_FAIL_CLASS="busy"; else ANAMNESIS_FAIL_CLASS="local"; fi ;;
+            *[!0-9]*) ANAMNESIS_FAIL_CLASS="local" ;;
             *) kill -0 "$holder" 2>/dev/null && ANAMNESIS_FAIL_CLASS="busy" || ANAMNESIS_FAIL_CLASS="local" ;;
         esac
         if [ "$ANAMNESIS_FAIL_CLASS" = "busy" ]; then
@@ -216,11 +252,17 @@ anamnesis_ensure_token() {
         fi
         return 1
     fi
+    anamnesis_spend "$(LC_ALL=C awk -v t="$ANAMNESIS_LOCK_WAITED" 'BEGIN { printf "%.1f", t / 2 }')"
     if ! anamnesis_load_config; then
         ANAMNESIS_FAIL_CLASS="local"
         rc=1
     elif [ "$ANAMNESIS_AUTH_MODE" = "oauth" ] && ! anamnesis_token_fresh; then
-        anamnesis_refresh_locked || rc=1
+        if ! anamnesis_refresh_locked; then
+            rc=1
+            ANAMNESIS_REFRESH_FAILED=1
+            ANAMNESIS_REFRESH_FAIL_CLASS="$ANAMNESIS_FAIL_CLASS"
+            ANAMNESIS_REFRESH_FAIL_NOTE="$ANAMNESIS_FAIL_NOTE"
+        fi
     fi
     anamnesis_lock_release "$lock"
     return $rc
@@ -238,8 +280,8 @@ anamnesis_refresh_locked() {
     anamnesis_tmp_guard "$dir"
     anamnesis_refresh_in "$dir"
     rc=$?
-    # anamnesis_refresh_in ignored TERM and HUP while a rotated token was in
-    # flight; the guard's own handlers come back now.
+    # anamnesis_refresh_in ignored INT, TERM and HUP while a rotated token
+    # was in flight; the guard's own handlers come back now.
     anamnesis_trap_signals
     rm -rf "$dir"
     anamnesis_tmp_unguard
@@ -264,9 +306,11 @@ anamnesis_refresh_in() {
         return 1
     fi
     # From here to the rename the server may already have rotated the
-    # token; a TERM or HUP now would lose the new pair and cost a sign-in,
-    # so both wait until anamnesis_refresh_locked puts the handlers back.
-    trap '' TERM HUP
+    # token; a stop now would lose the new pair and cost a sign-in, so INT,
+    # TERM and HUP all wait until anamnesis_refresh_locked puts the
+    # handlers back (the host's KILL cannot be waited out; the sweep covers
+    # what it leaves).
+    trap '' INT TERM HUP
     anamnesis_curl "$max" -X POST "${ANAMNESIS_SERVER_URL}/oauth/token" \
         -H "Content-Type: application/x-www-form-urlencoded" -H "X-Anamnesis-Client: $ANAMNESIS_CLIENT" \
         --data-binary @"$dir/form" -o "$dir/resp"
@@ -348,6 +392,8 @@ anamnesis_tmp_guard() {
     ANAMNESIS_TMP_GUARDED="$1"
     ANAMNESIS_TMP_GUARDED_FILE=""
     anamnesis_trap_install
+    # The sweep spares a directory whose owner is still alive.
+    printf '%s' "${ANAMNESIS_SELF_PID:-}" > "$1/pid"
 }
 
 anamnesis_tmp_unguard() {
@@ -355,55 +401,122 @@ anamnesis_tmp_unguard() {
     ANAMNESIS_TMP_GUARDED_FILE=""
 }
 
+# The child gets TERM, then KILL for one that inherited TERM ignored (a
+# refresh curl), and is reaped, so the directory it writes to is removed
+# after it has stopped writing. Nothing here fails: a child already gone
+# or a directory already removed is the state wanted, and under set -e a
+# failing step would end the cleanup halfway.
 anamnesis_tmp_cleanup() {
-    [ -z "${ANAMNESIS_CHILD_PID:-}" ] || kill "$ANAMNESIS_CHILD_PID" 2>/dev/null
-    [ -z "${ANAMNESIS_TMP_GUARDED:-}" ] || rm -rf "$ANAMNESIS_TMP_GUARDED"
-    [ -z "${ANAMNESIS_TMP_GUARDED_FILE:-}" ] || rm -f "$ANAMNESIS_TMP_GUARDED_FILE"
+    if [ -n "${ANAMNESIS_CHILD_PID:-}" ]; then
+        kill "$ANAMNESIS_CHILD_PID" 2>/dev/null || :
+        kill -KILL "$ANAMNESIS_CHILD_PID" 2>/dev/null || :
+        wait "$ANAMNESIS_CHILD_PID" 2>/dev/null || :
+        ANAMNESIS_CHILD_PID=""
+    fi
+    if [ -n "${ANAMNESIS_WATCHDOG_PID:-}" ]; then
+        kill "$ANAMNESIS_WATCHDOG_PID" 2>/dev/null || :
+        ANAMNESIS_WATCHDOG_PID=""
+    fi
+    [ -z "${ANAMNESIS_TMP_GUARDED:-}" ] || rm -rf "$ANAMNESIS_TMP_GUARDED" || :
+    [ -z "${ANAMNESIS_TMP_GUARDED_FILE:-}" ] || rm -f "$ANAMNESIS_TMP_GUARDED_FILE" || :
     return 0
 }
 
 # Installs the cleanup traps in this shell once, and keeps whatever trap
-# was there before by running it after the cleanup. Once per shell, not
-# once per process: a subshell (a background worker) starts with no traps,
-# so each installs its own. The traps stay for the shell's life; with
-# nothing guarded the cleanup does nothing.
+# was there before by running it after the cleanup. The shell is known by
+# its PID, not by what `trap -p` prints: a forked worker inherits the
+# variables and, on some bash versions, the trap text, but never the
+# handlers, so it must install its own. The traps stay for the shell's
+# life; with nothing guarded the cleanup does nothing.
 anamnesis_trap_install() {
-    case "$(trap -p EXIT)" in
-        *anamnesis_tmp_cleanup*) return 0 ;;
-    esac
+    anamnesis_self_pid || return 0
+    [ "$ANAMNESIS_TRAP_OWNER" != "$ANAMNESIS_SELF_PID" ] || return 0
     ANAMNESIS_PRIOR_TRAP_EXIT="$(anamnesis_trap_command EXIT)"
     ANAMNESIS_PRIOR_TRAP_INT="$(anamnesis_trap_command INT)"
     ANAMNESIS_PRIOR_TRAP_TERM="$(anamnesis_trap_command TERM)"
     ANAMNESIS_PRIOR_TRAP_HUP="$(anamnesis_trap_command HUP)"
-    trap 'anamnesis_tmp_cleanup; eval "$ANAMNESIS_PRIOR_TRAP_EXIT"' EXIT
+    ANAMNESIS_TRAP_OWNER="$ANAMNESIS_SELF_PID"
+    trap 'anamnesis_on_exit' EXIT
     anamnesis_trap_signals
 }
 
 # Hooks always exit 0, a stop included: the host reads anything else as a
 # hook error of its own.
 anamnesis_trap_signals() {
-    trap 'anamnesis_tmp_cleanup; eval "$ANAMNESIS_PRIOR_TRAP_INT"; exit 0' INT
-    trap 'anamnesis_tmp_cleanup; eval "$ANAMNESIS_PRIOR_TRAP_TERM"; exit 0' TERM
-    trap 'anamnesis_tmp_cleanup; eval "$ANAMNESIS_PRIOR_TRAP_HUP"; exit 0' HUP
+    trap 'anamnesis_on_signal INT' INT
+    trap 'anamnesis_on_signal TERM' TERM
+    trap 'anamnesis_on_signal HUP' HUP
+}
+
+# The prior EXIT command sees the status the shell was exiting with, not
+# the cleanup's. errexit is off meanwhile: the subshell that sets that
+# status would otherwise end the handler before the prior command ran.
+anamnesis_on_exit() {
+    local rc=$? errexit=""
+    case "$-" in *e*) errexit=1 ;; esac
+    set +e
+    anamnesis_tmp_cleanup
+    if [ -n "$ANAMNESIS_PRIOR_TRAP_EXIT" ]; then
+        (exit "$rc")
+        eval "$ANAMNESIS_PRIOR_TRAP_EXIT"
+    fi
+    [ -z "$errexit" ] || set -e
+}
+
+anamnesis_on_signal() {
+    local prior
+    anamnesis_tmp_cleanup
+    eval "prior=\"\$ANAMNESIS_PRIOR_TRAP_$1\""
+    [ -z "$prior" ] || eval "$prior"
+    exit 0
+}
+
+# The watchdog's signal: the cap passed, whatever the clock said. The
+# failure is logged, the hook's own output for the case goes out, and the
+# hook ends before the host would end it.
+anamnesis_on_deadline() {
+    ANAMNESIS_FAIL_CLASS="timeout"
+    ANAMNESIS_FAIL_NOTE="the $ANAMNESIS_DEADLINE_CAP s cap passed at stage ${ANAMNESIS_FAIL_STAGE:-none}"
+    anamnesis_log_error "deadline_hit" "$(anamnesis_failure_detail)"
+    anamnesis_tmp_cleanup
+    [ -z "$ANAMNESIS_ON_DEADLINE" ] || eval "$ANAMNESIS_ON_DEADLINE"
+    exit 0
 }
 
 # Prints the command the current trap for <signal> runs, nothing when there
-# is none. `trap -p` prints "trap -- '<command>' SIG" with the command
-# shell-quoted, and bash 3.2 does report the parent's traps inside $(...).
+# is none. `trap -p` prints "trap -- '<command>' SIGTERM" (EXIT without the
+# prefix) with the command shell-quoted, and bash 3.2 does report the
+# parent's traps inside $(...).
 anamnesis_trap_command() {
     local p
     p="$(trap -p "$1")"
     [ -n "$p" ] || return 0
     p="${p#trap -- }"
+    p="${p% "SIG$1"}"
     p="${p% "$1"}"
     eval "printf '%s' $p"
 }
 
 # The clock, as a fractional epoch: jq's, since jq is already required and
-# bash 3.2 has no sub-second time of its own.
+# bash 3.2 has no sub-second time of its own. ANAMNESIS_TEST_CLOCK names a
+# file the test suite moves the clock with; nothing else sets it.
 anamnesis_now() {
-    jq -n 'now'
+    if [ -n "${ANAMNESIS_TEST_CLOCK:-}" ]; then
+        cat "$ANAMNESIS_TEST_CLOCK" 2>/dev/null
+    else
+        jq -n 'now' 2>/dev/null
+    fi
 }
+
+# Adds seconds this hook has itself accounted for (ANAMNESIS_SPENT).
+anamnesis_spend() {
+    case "$1" in
+        ''|*[!0-9.]*) return 0 ;;
+    esac
+    ANAMNESIS_SPENT="$(LC_ALL=C awk -v a="$ANAMNESIS_SPENT" -v b="$1" 'BEGIN { printf "%.2f", a + b }')"
+}
+
+ANAMNESIS_HOOK_START="$(anamnesis_now)"
 
 # Usage: anamnesis_set_deadline <seconds> <most> <setting-name>
 # Puts everything a hook does from now on under one elapsed deadline, so a
@@ -423,18 +536,31 @@ anamnesis_set_deadline() {
         want="$most"
     fi
     ANAMNESIS_DEADLINE="$want"
+    ANAMNESIS_DEADLINE_CAP="$most"
     ANAMNESIS_DEADLINE_AT="$(LC_ALL=C awk -v n="$(anamnesis_now)" -v d="$want" 'BEGIN { printf "%.3f", n + d }')"
+    # Bash has no monotonic clock, so a watchdog ends the hook at the cap
+    # whatever the clock does: it gets ALRM, logs, prints its output for
+    # the case and exits before the host would end it.
+    anamnesis_trap_install
+    trap 'anamnesis_on_deadline' ALRM
+    ( sleep "$most"; kill -ALRM "$ANAMNESIS_SELF_PID" ) >/dev/null 2>&1 &
+    ANAMNESIS_WATCHDOG_PID=$!
 }
 
-# Seconds since the current request began, for the log.
+# Seconds since the current request began, or since the hook began when no
+# request has, for the log.
 anamnesis_elapsed() {
-    LC_ALL=C awk -v s="${ANAMNESIS_REQUEST_START:-0}" -v n="$(anamnesis_now)" 'BEGIN { if (s == 0) s = n; printf "%.2f", n - s }'
+    LC_ALL=C awk -v s="${ANAMNESIS_REQUEST_START:-${ANAMNESIS_HOOK_START:-0}}" -v n="$(anamnesis_now)" 'BEGIN { if (s == 0) s = n; printf "%.2f", n - s }'
 }
 
-# Seconds left on the deadline, or nothing when no deadline is set.
+# Seconds left on the deadline, or nothing when no deadline is set: what
+# the clock says, or the budget less what this hook has accounted for
+# itself, whichever is smaller, so a clock that steps backwards cannot
+# hand out time.
 anamnesis_time_left() {
     [ -n "$ANAMNESIS_DEADLINE_AT" ] || return 0
-    LC_ALL=C awk -v e="$ANAMNESIS_DEADLINE_AT" -v n="$(anamnesis_now)" 'BEGIN { printf "%.2f", e - n }'
+    LC_ALL=C awk -v e="$ANAMNESIS_DEADLINE_AT" -v n="$(anamnesis_now)" -v d="$ANAMNESIS_DEADLINE" -v s="$ANAMNESIS_SPENT" \
+        'BEGIN { c = e - n; a = d - s; printf "%.2f", (a < c) ? a : c }'
 }
 
 # Prints --max-time for the next curl: the per-request cap, or what is left
@@ -457,28 +583,38 @@ anamnesis_budget_left() {
 # waits on so a stop reaches it at once; sets ANAMNESIS_STATUS and
 # ANAMNESIS_CURL_EXIT and counts the call in ANAMNESIS_ATTEMPTS.
 anamnesis_curl() {
-    local max="$1"
+    local max="$1" report took
     shift
     ANAMNESIS_ATTEMPTS=$((ANAMNESIS_ATTEMPTS + 1))
     LC_ALL=C curl -sS --connect-timeout "$ANAMNESIS_CONNECT_TIMEOUT" --max-time "$max" \
-        -w '%{http_code}' "$@" > "$ANAMNESIS_TMP_GUARDED/status" 2>/dev/null &
+        -w '%{http_code} %{time_total}' "$@" > "$ANAMNESIS_TMP_GUARDED/status" 2>/dev/null &
     ANAMNESIS_CHILD_PID=$!
-    wait "$ANAMNESIS_CHILD_PID"
-    ANAMNESIS_CURL_EXIT=$?
+    # `|| rc` keeps a failing child from ending a caller that runs set -e.
+    ANAMNESIS_CURL_EXIT=0
+    wait "$ANAMNESIS_CHILD_PID" || ANAMNESIS_CURL_EXIT=$?
     ANAMNESIS_CHILD_PID=""
-    ANAMNESIS_STATUS="$(cat "$ANAMNESIS_TMP_GUARDED/status" 2>/dev/null)"
+    report="$(cat "$ANAMNESIS_TMP_GUARDED/status" 2>/dev/null)"
+    ANAMNESIS_STATUS="${report%% *}"
+    took="${report#* }"
     case "$ANAMNESIS_STATUS" in
         [0-9][0-9][0-9]) ;;
         *) ANAMNESIS_STATUS="000" ;;
     esac
+    # A call that reported no time is charged its whole limit, so a stuck
+    # attempt can never look free.
+    case "$took" in
+        ''|*[!0-9.]*|"$report") took="$max" ;;
+    esac
+    anamnesis_spend "$took"
 }
 
 # A sleep the shell waits on, so a stop ends it at once.
 anamnesis_pause() {
     sleep "$1" &
     ANAMNESIS_CHILD_PID=$!
-    wait "$ANAMNESIS_CHILD_PID"
+    wait "$ANAMNESIS_CHILD_PID" || :
     ANAMNESIS_CHILD_PID=""
+    anamnesis_spend "$1"
 }
 
 # Sets ANAMNESIS_FAIL_CLASS from the last curl: curl exit 28 is a timeout,
@@ -629,6 +765,13 @@ anamnesis_request_in() {
             return 1
         fi
         rm -f "$dir/headers" "$dir/body"
+        ANAMNESIS_FAIL_NOTE=""
+        # A retry names its attempt, so the server can tell one recall
+        # tried twice from two recalls.
+        if [ "$ANAMNESIS_ATTEMPTS" -gt 0 ] && [ "$method" = "POST" ]; then
+            jq -c --argjson a "$((ANAMNESIS_ATTEMPTS + 1))" 'if type == "object" then . + {attempt: $a} else . end' \
+                < "$dir/req" > "$dir/req.retry" 2>/dev/null && mv -f "$dir/req.retry" "$dir/req"
+        fi
         if [ "$method" = "POST" ]; then
             anamnesis_curl "$max" -X POST "${ANAMNESIS_SERVER_URL}${path}" \
                 -H @"$dir/auth" -H "Content-Type: application/json" \
@@ -749,6 +892,9 @@ anamnesis_lock_acquire() {
     ANAMNESIS_LOCK_WAITED=0
     anamnesis_self_pid || return 1
     while ! ln -sn "$ANAMNESIS_SELF_PID" "$lock" 2>/dev/null; do
+        # ln failed with no lock there: the directory itself refuses, and
+        # waiting would not change that.
+        [ -L "$lock" ] || return 1
         # A reclaim that succeeded removed a dead holder's link, so retrying
         # at once cannot loop unless a holder dies every time.
         anamnesis_lock_reclaim "$lock" && continue
@@ -947,6 +1093,7 @@ anamnesis_start_background_sync() {
         # The background has the time a foreground hook has not: no deadline,
         # and the full wait for a refresh another process is running.
         ANAMNESIS_DEADLINE="" ANAMNESIS_DEADLINE_AT="" ANAMNESIS_RETRY="" ANAMNESIS_REFRESH_WAIT=20
+        ANAMNESIS_WATCHDOG_PID="" ANAMNESIS_ON_DEADLINE="" ANAMNESIS_REFRESH_FAILED="" ANAMNESIS_SPENT=0
         anamnesis_sweep_abandoned
         anamnesis_drain_queue
         anamnesis_post "/mcp/tools/get_memory_stats" '{}' >/dev/null \
@@ -960,11 +1107,21 @@ anamnesis_start_background_sync() {
 # temp from an interrupted refresh. Only this user's, and only when older
 # than ten minutes, so nothing in flight is touched.
 anamnesis_sweep_abandoned() {
-    local me
+    local me d owner
     me="$(id -un 2>/dev/null)" || return 0
-    find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name 'anamnesis.??????' -o -name 'anamnesis-pid.??????' \) \
-        -user "$me" -mmin +10 -exec rm -rf {} + 2>/dev/null
-    find "$ANAMNESIS_HOME" -maxdepth 1 -name 'config.json.??????' -type f -mmin +10 -delete 2>/dev/null
+    # A request directory names its owner in pid; one whose owner still
+    # runs is in flight, however old (a long per-request cap allows that).
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'anamnesis.??????' -type d -user "$me" -mmin +10 2>/dev/null \
+        | while IFS= read -r d; do
+            owner="$(cat "$d/pid" 2>/dev/null)"
+            case "$owner" in
+                ''|*[!0-9]*) ;;
+                *) kill -0 "$owner" 2>/dev/null && continue ;;
+            esac
+            rm -rf "$d"
+        done
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'anamnesis-pid.??????' -type f -user "$me" -mmin +10 -delete 2>/dev/null
+    find "$ANAMNESIS_HOME" -maxdepth 1 -name 'config.json.??????' -type f -user "$me" -mmin +10 -delete 2>/dev/null
     return 0
 }
 
@@ -1057,8 +1214,29 @@ anamnesis_prompt_hook() {
 anamnesis_config_fault_hook() {
     local msg=""
     [ -n "${ANAMNESIS_CONFIG_FAULT:-}" ] || return 0
+    command -v jq >/dev/null 2>&1 && anamnesis_resolve_sid "$ANAMNESIS_STDIN"
     anamnesis_receipt_once "fail.config" && msg="[anamnesis] recall unavailable this turn ($ANAMNESIS_CONFIG_FAULT)"
-    anamnesis_prompt_output "$1" "[]" "$msg"
+    if command -v jq >/dev/null 2>&1; then
+        anamnesis_prompt_output "$1" "[]" "$msg"
+    else
+        anamnesis_plain_output "$1" "$msg"
+    fi
+}
+
+# Usage: anamnesis_plain_output <hook-event-name> <message>
+# The hook's JSON without jq, for the one fault jq cannot report: only the
+# date/time anchor and the fixed message, neither of which holds a quote.
+anamnesis_plain_output() {
+    printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"<current-datetime local=\\"%s\\" source=\\"anamnesis\\"/>"}' \
+        "$1" "$(date '+%a, %d %b %Y %H:%M:%S %z')"
+    [ -z "$2" ] || printf ',"systemMessage":"%s"' "$2"
+    printf '}\n'
+}
+
+# What a prompt hook prints when the watchdog ends it: the anchor and the
+# timeout notice, if due.
+anamnesis_prompt_deadline() {
+    anamnesis_prompt_output "$1" "[]" "$(anamnesis_recall_notice)"
 }
 
 # Usage: anamnesis_prompt_output <hook-event-name> <lines-json> <message>
@@ -1080,6 +1258,8 @@ anamnesis_prompt_output() {
     printf '%s' "$addl" | jq -Rs --arg ev "$event" --arg msg "$msg" '
         {hookSpecificOutput: {hookEventName: $ev, additionalContext: .}}
         + (if $msg == "" then {} else {systemMessage: $msg} end)'
+    # The output is out; a watchdog firing now must not print a second.
+    ANAMNESIS_ON_DEADLINE=""
 }
 
 # True when ANAMNESIS_RESPONSE has the shape of a recall answer: an object
@@ -1115,7 +1295,7 @@ anamnesis_recall_notice() {
     local class="${ANAMNESIS_FAIL_CLASS:-local}" why
     anamnesis_receipt_once "fail.$class" || return 0
     case "$class" in
-        timeout) why="timed out after $(anamnesis_failure_limit) s" ;;
+        timeout) why="timed out after $(anamnesis_elapsed | LC_ALL=C awk '{ printf "%.1f", $1 }') s of the $(anamnesis_failure_limit) s budget" ;;
         connect) why="could not connect, curl exit ${ANAMNESIS_CURL_EXIT:-none}" ;;
         server)
             case "$ANAMNESIS_STATUS" in
@@ -1289,15 +1469,20 @@ anamnesis_receipt_marker() {
         "$(anamnesis_transcript_key "${ANAMNESIS_SID:-nosid}")" "$1"
 }
 
-# Returns 0 (and marks) the first time a class fires this session; 1 after.
+# Returns 0 (and marks) the first time a class fires this session; 1 after,
+# and 1 when the mark cannot be written: a notice that cannot be remembered
+# would come back on every prompt, so it is left out and the store logged.
 anamnesis_receipt_once() {
     anamnesis_receipt_fired "$1" && return 1
     anamnesis_receipt_mark "$1"
-    return 0
 }
 
 anamnesis_receipt_mark() {
-    : 2>/dev/null > "$(anamnesis_receipt_marker "$1")"
+    if ! : 2>/dev/null > "$(anamnesis_receipt_marker "$1")"; then
+        [ -n "$ANAMNESIS_RECEIPTS_UNWRITABLE" ] || anamnesis_log_error "receipt_store_unwritable" "$ANAMNESIS_RECEIPT_DIR cannot be written; receipts and notices are held back"
+        ANAMNESIS_RECEIPTS_UNWRITABLE=1
+        return 1
+    fi
     return 0
 }
 
