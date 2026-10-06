@@ -25,16 +25,18 @@ ANAMNESIS_SUPERVISED_LOG="${ANAMNESIS_HOME:-$HOME/.anamnesis}/hook_errors.log"
 ANAMNESIS_JSON=""
 
 # Sets ANAMNESIS_JSON to <text> made safe inside a JSON string, with
-# builtins only: backslash, quote, newline, return and tab escaped, any
-# other control character dropped.
+# builtins only: backslash, quote, newline, return and tab escaped, and
+# every other byte outside printable ASCII dropped, so what is printed is
+# valid UTF-8 whatever locale or bytes it came from. The text is our own
+# fixed notices and a clock, all ASCII.
 anamnesis_json_text() {
-    local s="$1"
+    local LC_ALL=C s="$1"
     s="${s//\\/\\\\}"
     s="${s//\"/\\\"}"
     s="${s//$'\n'/\\n}"
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
-    ANAMNESIS_JSON="${s//[[:cntrl:]]/}"
+    ANAMNESIS_JSON="${s//[^[:print:]]/}"
 }
 
 # Usage: anamnesis_plain_output <hook-event-name> <message> [local-time]
@@ -47,7 +49,7 @@ anamnesis_plain_output() {
         printf '%s' "$2" > "$ANAMNESIS_SUPERVISED_DIR/notice"
         return 0
     fi
-    [ -n "$now" ] || now="$(date '+%a, %d %b %Y %H:%M:%S %z')"
+    [ -n "$now" ] || now="$(LC_ALL=C date '+%a, %d %b %Y %H:%M:%S %z')"
     anamnesis_json_text "$2"
     msg="$ANAMNESIS_JSON"
     anamnesis_json_text "$now"
@@ -146,15 +148,18 @@ anamnesis_supervise_timer() {
     kill -TERM 0
 }
 
-# The command: runs it into part, and publishes part as done only when it
-# is safe to print. The times the hook prints and logs are taken here, under
-# the limit. jq checks the output here too; with no jq that runs, only a
-# notice handed over through anamnesis_plain_output is passed on.
+# The command: runs it into part, and publishes as done only what is safe
+# to print. The times the hook prints and logs are taken here, under the
+# limit. What is published is jq's own ASCII re-serialisation of the one
+# object, never the bytes the work wrote: jq reads 01 and NaN, which strict
+# JSON does not. With no jq that runs, only a notice handed over through
+# anamnesis_plain_output is passed on.
 anamnesis_supervised_work() {
     local dir="$ANAMNESIS_SUPERVISED_DIR" rc
     ANAMNESIS_SUPERVISED_WORK=1
-    date '+%a, %d %b %Y %H:%M:%S %z' > "$dir/now"
-    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$dir/ts"
+    # The C locale keeps the month and day names in ASCII.
+    LC_ALL=C date '+%a, %d %b %Y %H:%M:%S %z' > "$dir/now"
+    LC_ALL=C date -u +"%Y-%m-%dT%H:%M:%SZ" > "$dir/ts"
     ANAMNESIS_SUPERVISED_TS="$(cat "$dir/ts")"
     "$@" > "$dir/part"
     rc=$?
@@ -169,11 +174,12 @@ anamnesis_supervised_work() {
         anamnesis_supervise_log "work_failed" "no jq to check the hook's output"
         return 0
     fi
-    if ! jq -es 'length == 1 and (.[0] | type == "object")' "$dir/part" >/dev/null 2>&1; then
+    if ! jq -sac 'if length == 1 and (.[0] | type == "object") then .[0] else error("shape") end' \
+        "$dir/part" > "$dir/checked" 2>/dev/null; then
         anamnesis_supervise_log "work_failed" "the hook's work printed something other than one JSON object"
         return 0
     fi
-    mv "$dir/part" "$dir/done"
+    mv "$dir/checked" "$dir/done"
 }
 
 # The times the work wrote, read with builtins; absent ones stay empty.

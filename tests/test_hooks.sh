@@ -434,7 +434,7 @@ out="$(bash -c '. "$0"; anamnesis_load_config; w() { anamnesis_pause 10 >/dev/nu
 check "the supervisor ends stuck work at its limit, one notice" "$? $(jq -c . <<<"$out" | wc -l | tr -d ' ') $(jq -r .systemMessage <<<"$out") $(grep -c 'not-reached\|after' <<<"$out") $([ $((SECONDS - start)) -le 3 ] && echo quick) $(grep -c deadline_hit "$ANAMNESIS_HOME/hook_errors.log")" "0 1 [anamnesis] stopped 0 quick 1"
 # Work that finishes in time is printed as it wrote it.
 out="$(bash -c '. "$0"; w() { printf "{\"a\":\n1}\n"; }; anamnesis_supervise X 5 "late" "failed" w' "$HOOKS/common.sh")"
-check "finished work is printed whole" "$(tr '\n' ' ' <<<"$out")" '{"a": 1} '
+check "finished work is printed whole, as jq writes it" "$(tr '\n' ' ' <<<"$out")" '{"a":1} '
 # Work that fails, or prints anything but one JSON object, is never passed
 # on: the fixed failure notice goes out instead, and the failure is logged.
 new_home
@@ -445,6 +445,16 @@ done
 check "each failed work is logged" "$(grep -c work_failed "$ANAMNESIS_HOME/hook_errors.log")" 4
 # Work that ends cleanly with nothing to say prints nothing.
 check "silent work stays silent" "$(bash -c '. "$0"; w() { :; }; anamnesis_supervise UserPromptSubmit 5 "late" "failed" w' "$HOOKS/common.sh" | wc -c | tr -d ' ')" 0
+# What jq reads but strict JSON does not (01, NaN, a raw 0xff byte) reaches
+# the host as jq's strict ASCII re-serialisation, never as the work wrote it.
+for body in '{"x":01}' '{"x":NaN}' "$(printf '{"x":"a\377b"}')"; do
+    out="$(bash -c '. "$0"; w() { printf "%s" "$1"; }; anamnesis_supervise X 5 "late" "failed" w "$1"' "$HOOKS/common.sh" "$body")"
+    check "lenient JSON is re-serialised strictly ($(printf '%s' "$body" | LC_ALL=C tr -c '[:print:]' '?'))" "$(python3 -c 'import json,sys; d=sys.stdin.buffer.read(); d.decode("ascii"); json.loads(d, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c))); print("strict")' <<<"$out" 2>/dev/null)" strict
+done
+# A clock in a locale with non-ASCII month names still gives ASCII.
+out="$(LC_ALL=fr_FR.ISO8859-1 LANG=fr_FR.ISO8859-1 bash -c '. "$0"; w() { sleep 5; }; anamnesis_supervise X 1 "[anamnesis] stopped" "" w' "$HOOKS/common.sh")"
+check "the late notice is ASCII in any locale" "$(LC_ALL=C grep -c '[^[:print:]]' <<<"$out") $(jq -r .systemMessage <<<"$out")" "0 [anamnesis] stopped"
+check "a notice's non-ASCII bytes are dropped" "$(bash -c '. "$0"; anamnesis_plain_output X "$(printf "caf\351 ok")" "Thu"' "$HOOKS/common.sh" | LC_ALL=C grep -c '[^[:print:]]')" 0
 # A host stop ends the work too and prints nothing.
 new_home
 bash -c '. "$0"; n="$1"; w() { anamnesis_pause "23.$n"; echo late-output; }; anamnesis_supervise X "31.$n" "late" "" w' "$HOOKS/common.sh" "$$" > "$WORK/stopped.out" &
