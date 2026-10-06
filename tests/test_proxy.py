@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -122,6 +123,22 @@ class ProxyTest(unittest.TestCase):
         self.finish(proxy)
         for needle in ("/oauth/token", "/mcp"):
             self.assertEqual(json.loads(self.requests(needle)[-1])["client"], f"codex-proxy/{version}")
+
+    def test_a_manifest_version_with_line_breaks_cannot_reach_the_header(self):
+        # A copy of the proxy under its own plugin root, so the real manifest stays untouched.
+        root = os.path.join(self.tmp.name, "plugin")
+        os.makedirs(os.path.join(root, "bin"))
+        os.makedirs(os.path.join(root, ".codex-plugin"))
+        shutil.copy(PROXY, os.path.join(root, "bin", "anamnesis-mcp-proxy"))
+        self._write(os.path.join(root, ".codex-plugin", "plugin.json"), {"version": "1.0\r\nX-Evil: yes"})
+        proxy = subprocess.Popen(
+            [sys.executable, os.path.join(root, "bin", "anamnesis-mcp-proxy")], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, "ANAMNESIS_HOME": self.home, "ANAMNESIS_CAPTURE": "on"})
+        reply = self.call(proxy, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.finish(proxy)
+        self.assertIn("result", reply)
+        self.assertEqual(json.loads(self.requests("/mcp")[-1])["client"], "codex-proxy/0")
 
     def test_refreshes_an_expired_token_and_saves_it_0600(self):
         self.write_config(access_token="at0", refresh_token="rt0", expires_at=0)

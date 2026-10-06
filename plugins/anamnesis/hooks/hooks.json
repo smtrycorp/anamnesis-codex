@@ -3,14 +3,14 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "/bin/bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/session-start.sh\"" }
+          { "type": "command", "command": "/bin/bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/session-start.sh\"", "timeout": 20 }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "/bin/bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/user-prompt-submit.sh\"" }
+          { "type": "command", "command": "/bin/bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/user-prompt-submit.sh\"", "timeout": 15 }
         ]
       }
     ],

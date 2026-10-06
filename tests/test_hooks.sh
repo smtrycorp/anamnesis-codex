@@ -210,4 +210,76 @@ check "invalid_grant: logged as a refresh-stage failure" "$(last_failure | grep 
 check "the refresh names the client too" "$(grep oauth/token "$SRV/requests" | tail -1 | jq -r .client)" "codex/$(jq -r .version plugins/anamnesis/.codex-plugin/plugin.json)"
 routes '{}'
 
+
+# Review round: the host gives each foreground hook more time than its own
+# deadline, or a kill would be the one silent failure left.
+deadline() { sed -En 's/.*ANAMNESIS_(PROMPT|SESSION_START)_TIMEOUT:-([0-9]+)}.*/\2/p' "$1"; }
+host_timeout() { jq -r --arg ev "$1" '.hooks[$ev][0].hooks[0].timeout' plugins/anamnesis/hooks/hooks.json; }
+check "host timeout for the prompt hook exceeds its deadline" "$([ "$(host_timeout UserPromptSubmit)" -ge $(( $(deadline "$HOOKS/user-prompt-submit.sh") + 2 )) ] && echo roomy)" roomy
+check "host timeout for session start exceeds its deadline" "$([ "$(host_timeout SessionStart)" -ge $(( ${START_DEADLINE:-12} + 2 )) ] && echo roomy)" roomy
+
+# A hook the host stops mid-request takes the request's temp directory
+# with it once curl lets go, and produces no output.
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"delay": 4}}'
+mkdir -p "$WORK/tmp.$$"
+TMPDIR="$WORK/tmp.$$" "$HOOKS/user-prompt-submit.sh" <<<'{"prompt":"q","session_id":"s"}' > "$WORK/killed.out" &
+victim=$!
+sleep 1.5
+kill -TERM "$victim"
+wait "$victim"
+check "a stopped hook exits without output" "$? $(wc -c < "$WORK/killed.out" | tr -d ' ')" "1 0"
+check "and leaves no credential file behind" "$(ls "$WORK/tmp.$$" | grep -c anamnesis)" 0
+routes '{}'
+
+# An exported deadline or retry flag does not put a capture under retry.
+new_home
+routes '{"/mcp/tools/log_session": {"delay": 10}}'
+rollout new
+printf '{"session_id":"s","transcript_path":"%s","last_assistant_message":"x"}' "$T" | ANAMNESIS_DEADLINE=8 ANAMNESIS_RETRY=1 "$HOOKS/stop.sh" >/dev/null
+sleep 10
+routes '{}'
+check "a capture under an exported deadline is sent once" "$(count_req log_session)" 1
+
+# A comma locale does not break the budget arithmetic.
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"status": 503}}'
+LC_ALL=de_DE.UTF-8 recall s >/dev/null
+check "under a comma locale the time is still counted" "$(last_failure | grep -c 'HTTP 503, 0\.[0-9][0-9] s against the 8 s deadline')" 1
+
+# A prompt over 4,000 characters is cut, not mistaken for a failure; an
+# answer jq cannot read is a parse failure, not "0 memories".
+new_home
+routes "{\"/mcp/tools/retrieve_memories\": {\"body\": $HIT}}"
+out="$(python3 -c 'import json; print(json.dumps({"prompt": "p" * 4001, "session_id": "s"}))' | "$HOOKS/user-prompt-submit.sh")"
+check "a 4,001-character prompt is recalled without a notice" "$(jq -r '.systemMessage // empty' <<<"$out" | grep -c unavailable) $(failures)" "0 0"
+routes '{"/mcp/tools/retrieve_memories": {"body": {"status": "ok", "headlines": [], "results": ["a bare string"]}}}'
+check "an unreadable answer is a parse failure" "$(notice s)" "[anamnesis] recall unavailable this turn (unexpected reply)"
+check "and is logged as one" "$(last_failure | grep -c '^response_parse: ')" 1
+
+# A notice shown in one session is due again in the next, and again when a
+# session is resumed under its old id.
+new_home
+routes '{"/mcp/tools/retrieve_memories": {"status": 503}}'
+check "session A is told" "$(notice a)" "[anamnesis] recall unavailable this turn (server 503)"
+check "session B is told too" "$(notice b)" "[anamnesis] recall unavailable this turn (server 503)"
+check "and not twice" "$(notice b)" ""
+echo '{"session_id":"b"}' | "$HOOKS/session-start.sh" >/dev/null
+check "session B resumed is told again" "$(notice b)" "[anamnesis] recall unavailable this turn (server 503)"
+routes '{}'
+
+# Settings and server text that must not reach the user or the log unchecked.
+new_home
+routes "{\"/mcp/tools/retrieve_memories\": {\"body\": $HIT}}"
+ANAMNESIS_CURL_TIMEOUT=0 recall s >/dev/null
+check "a zero per-request cap is replaced and said so" "$(grep -c setting_ignored "$ANAMNESIS_HOME/hook_errors.log") $(count_req retrieve_memories)" "1 1"
+routes '{"/mcp/tools/retrieve_memories": {"body": {"status": "error", "message": "planted-secret-message"}}}'
+notice s >/dev/null
+check "a server error message is logged by length only" "$(grep -c planted-secret "$ANAMNESIS_HOME/hook_errors.log") $(grep server_reported_error "$ANAMNESIS_HOME/hook_errors.log" | jq -r .detail | grep -c 'message of 22 characters')" "0 1"
+jq '.expires_at = 0' "$ANAMNESIS_HOME/config.json" > "$ANAMNESIS_HOME/config.tmp" && mv "$ANAMNESIS_HOME/config.tmp" "$ANAMNESIS_HOME/config.json"
+routes '{"/oauth/token": {"status": 400, "body": {"error": "planted <b>html</b> error"}}}'
+notice s >/dev/null
+check "an odd OAuth error code is not copied into the log" "$(grep retrieve_failed "$ANAMNESIS_HOME/hook_errors.log" | tail -1 | jq -r .detail | grep -c ', oauth_error$')" 1
+routes '{}'
+
 exit $fail

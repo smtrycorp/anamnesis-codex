@@ -12,6 +12,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # The whole recall, token refresh and one retry included, fits this budget;
 # the wait for another process's refresh is two half-second ticks.
 ANAMNESIS_DEADLINE="${ANAMNESIS_PROMPT_TIMEOUT:-8}"
+ANAMNESIS_RETRY=1
 ANAMNESIS_REFRESH_WAIT=2
 
 anamnesis_load_config || exit 0

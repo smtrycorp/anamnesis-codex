@@ -155,6 +155,9 @@ honours a `Retry-After` it can fit in the budget. Every failure is logged
 with its cause and shown once per cause, a dead refresh token included. A
 reply that is not a recall answer counts as a failure, not as an empty
 result. Requests carry an `X-Anamnesis-Client` header.
+`ANAMNESIS_PROMPT_TIMEOUT` now sets the whole recall budget rather than
+one request's cap, and `hooks.json` gives the prompt hook 15 s and session
+start 20 s before Codex may stop them.
 
 ## What's different from the Claude / Gemini versions
 

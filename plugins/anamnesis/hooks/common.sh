@@ -31,9 +31,12 @@ ANAMNESIS_CONNECT_TIMEOUT="${ANAMNESIS_CONNECT_TIMEOUT:-3}"
 # Half-second ticks to wait for another process's token refresh.
 ANAMNESIS_REFRESH_WAIT="${ANAMNESIS_REFRESH_WAIT:-20}"
 # Seconds one anamnesis_request may take in all, refresh and retry
-# included. A foreground hook sets it; empty means one attempt capped by
-# ANAMNESIS_CURL_TIMEOUT and no retry, which is what background uploads want.
-ANAMNESIS_DEADLINE="${ANAMNESIS_DEADLINE:-}"
+# included, and whether a failed attempt gets one more try. A foreground
+# hook sets both for its own recall; they are never read from the
+# environment, so an exported value cannot put a capture under retry and
+# send it twice. Empty means one attempt capped by ANAMNESIS_CURL_TIMEOUT.
+ANAMNESIS_DEADLINE=""
+ANAMNESIS_RETRY=""
 ANAMNESIS_SID=""
 ANAMNESIS_RESPONSE=""
 ANAMNESIS_SERVER_TIME=""
@@ -52,6 +55,14 @@ ANAMNESIS_FAIL_NOTE=""
 ANAMNESIS_AUTH_WARNING="[anamnesis] the server rejected your sign-in, so recall is off and captures are queued on this machine. Run anamnesis-config to sign in again."
 
 mkdir -p "$ANAMNESIS_QUEUE_DIR" "$ANAMNESIS_STATE_DIR" "$ANAMNESIS_RECEIPT_DIR" 2>/dev/null
+
+# A per-request cap that is not a positive number (0 would make curl wait
+# for ever, junk would make it fail at once) is replaced by the default and
+# said so, rather than reported later as a timeout that never sent anything.
+if ! LC_ALL=C awk -v c="$ANAMNESIS_CURL_TIMEOUT" 'BEGIN { exit !(c + 0 > 0 && c ~ /^[0-9.]+$/) }'; then
+    ANAMNESIS_FAIL_NOTE="ANAMNESIS_CURL_TIMEOUT=$ANAMNESIS_CURL_TIMEOUT is not a positive number of seconds; using 8"
+    ANAMNESIS_CURL_TIMEOUT=8
+fi
 
 # Prints "<client>/<version>" for the X-Anamnesis-Client header on every
 # request, so the server can say which client and version a user runs. The
@@ -85,6 +96,8 @@ anamnesis_log_error() {
     printf '{"ts":"%s","event":"%s","detail":%s}\n' \
         "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$detail" >> "$ANAMNESIS_ERROR_LOG" 2>/dev/null
 }
+[ -z "$ANAMNESIS_FAIL_NOTE" ] || anamnesis_log_error "setting_ignored" "$ANAMNESIS_FAIL_NOTE"
+ANAMNESIS_FAIL_NOTE=""
 
 # False while `anamnesis pause` is in effect or ANAMNESIS_CAPTURE switches
 # capture off. An unrecognised value counts as off: a harness that misspells
@@ -148,7 +161,7 @@ anamnesis_ensure_token() {
     anamnesis_token_fresh && return 0
     local lock="$ANAMNESIS_HOME/refresh.lck" rc=0 taken=0
     anamnesis_lock_acquire "$lock" "$ANAMNESIS_REFRESH_WAIT" || taken=1
-    anamnesis_spend "$(awk -v t="$ANAMNESIS_LOCK_WAITED" 'BEGIN { printf "%.1f", t / 2 }')"
+    anamnesis_spend "$(LC_ALL=C awk -v t="$ANAMNESIS_LOCK_WAITED" 'BEGIN { printf "%.1f", t / 2 }')"
     if [ "$taken" -ne 0 ]; then
         ANAMNESIS_FAIL_CLASS="busy"
         anamnesis_log_error "refresh_skipped" "another process held $lock for the $ANAMNESIS_SPENT s wait"
@@ -167,24 +180,35 @@ anamnesis_ensure_token() {
 # Caller holds refresh.lck. The refresh token travels in a 0600 file, never
 # on a command line where ps would show it.
 anamnesis_refresh_locked() {
-    local dir tmp max oauth_error
+    local dir rc
     if ! dir="$(mktemp -d "${TMPDIR:-/tmp}/anamnesis.XXXXXX")"; then
         ANAMNESIS_FAIL_CLASS="local"
         anamnesis_log_error "refresh_failed" "mktemp failed"
         return 1
     fi
+    anamnesis_tmp_guard "$dir"
+    anamnesis_refresh_in "$dir"
+    rc=$?
+    rm -rf "$dir"
+    anamnesis_tmp_unguard
+    return $rc
+}
+
+# The body of anamnesis_refresh_locked, with the directory's removal left
+# to the caller so one path covers every return.
+anamnesis_refresh_in() {
+    local dir="$1" tmp max oauth_error
     if ! cp "$ANAMNESIS_CONFIG" "$dir/before" 2>/dev/null \
         || ! jq -j '"grant_type=refresh_token&refresh_token=\(.refresh_token | @uri)&client_id=\(.client_id // "" | @uri)"' \
             < "$dir/before" > "$dir/form" 2>/dev/null; then
         ANAMNESIS_FAIL_CLASS="local"
         anamnesis_log_error "refresh_failed" "could not build the refresh request from $ANAMNESIS_CONFIG"
-        rm -rf "$dir"
         return 1
     fi
     max="$(anamnesis_budget_left)"
     if [ "$max" = 0 ]; then
         ANAMNESIS_FAIL_CLASS="timeout"
-        rm -rf "$dir"
+        ANAMNESIS_FAIL_NOTE="no time left for the refresh"
         return 1
     fi
     anamnesis_curl "$max" -X POST "${ANAMNESIS_SERVER_URL}/oauth/token" \
@@ -193,8 +217,13 @@ anamnesis_refresh_locked() {
     if ! jq -e '.access_token | type == "string" and length > 0' < "$dir/resp" >/dev/null 2>&1; then
         # Only the status and the OAuth error fields: the body of an odd
         # success could hold a live token.
+        # The OAuth error code is server text; only a short bare token of it
+        # is kept for the recall log.
         oauth_error="$(jq -r '[.error, .error_description] | map(strings) | join(": ")' < "$dir/resp" 2>/dev/null)"
         ANAMNESIS_FAIL_NOTE="${oauth_error%%:*}"
+        case "$ANAMNESIS_FAIL_NOTE" in
+            ''|*[!A-Za-z0-9_]*|?????????????????????????????????????????*) ANAMNESIS_FAIL_NOTE="oauth_error" ;;
+        esac
         anamnesis_classify_failure
         # invalid_grant is the server saying this refresh token is dead for
         # good (revoked, rotated past, or the sign-in was deleted). Every
@@ -205,7 +234,6 @@ anamnesis_refresh_locked() {
             : > "$ANAMNESIS_AUTH_FAILED_FILE"
         fi
         anamnesis_log_error "refresh_failed" "curl exit $ANAMNESIS_CURL_EXIT, HTTP $ANAMNESIS_STATUS${oauth_error:+ $oauth_error}, $ANAMNESIS_SPENT s against the $max s limit"
-        rm -rf "$dir"
         return 1
     fi
     # The new pair belongs to the sign-in that sent the refresh token. A
@@ -215,7 +243,7 @@ anamnesis_refresh_locked() {
     if ! jq -e --slurpfile b "$dir/before" \
         '.server_url == $b[0].server_url and .client_id == $b[0].client_id and .refresh_token == $b[0].refresh_token' \
         < "$ANAMNESIS_CONFIG" >/dev/null 2>&1; then
-        rm -rf "$dir"
+        ANAMNESIS_FAIL_CLASS="local"
         anamnesis_log_error "refresh_discarded" "$ANAMNESIS_CONFIG was replaced during the refresh; the new tokens were not kept"
         return 1
     fi
@@ -227,11 +255,10 @@ anamnesis_refresh_locked() {
             | .expires_at = ((now | floor) + ($r[0].expires_in // 3600 | tonumber? // 3600 | floor))' \
             < "$ANAMNESIS_CONFIG" > "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$ANAMNESIS_CONFIG"; then
-        rm -rf "$dir"
-        anamnesis_load_config
-        return
+        anamnesis_load_config && return 0
+        ANAMNESIS_FAIL_CLASS="local"
+        return 1
     fi
-    rm -rf "$dir"
     [ -n "${tmp:-}" ] && rm -f "$tmp"
     # The server has already retired the old refresh token, so losing the
     # new pair here means signing in again.
@@ -240,13 +267,33 @@ anamnesis_refresh_locked() {
     return 1
 }
 
+# Usage: anamnesis_tmp_guard <dir> ... anamnesis_tmp_unguard
+# While a request runs, its directory holds the credential header, the
+# body and, for a refresh, a copy of config.json. A hook the host kills on
+# its timeout, or a user's Ctrl-C, must not leave those behind, so the
+# directory goes with the process; the traps that were there before (a
+# background worker's, say) are put back afterwards.
+anamnesis_tmp_guard() {
+    ANAMNESIS_TMP_GUARDED="$1"
+    ANAMNESIS_TRAPS_BEFORE="$(trap -p EXIT INT TERM HUP)"
+    trap 'rm -rf "$ANAMNESIS_TMP_GUARDED"' EXIT
+    trap 'rm -rf "$ANAMNESIS_TMP_GUARDED"; exit 1' INT TERM HUP
+}
+
+anamnesis_tmp_unguard() {
+    trap - EXIT INT TERM HUP
+    [ -z "$ANAMNESIS_TRAPS_BEFORE" ] || eval "$ANAMNESIS_TRAPS_BEFORE"
+}
+
 # Adds seconds to ANAMNESIS_SPENT. awk, because bash has no fractions and
-# curl reports its times in them.
+# curl reports its times in them; under LC_ALL=C, because awk would
+# otherwise print a comma for the decimal point in some locales and the
+# sum would be thrown away as junk.
 anamnesis_spend() {
     case "$1" in
         ''|*[!0-9.]*) return 0 ;;
     esac
-    ANAMNESIS_SPENT="$(awk -v a="$ANAMNESIS_SPENT" -v b="$1" 'BEGIN { printf "%.2f", a + b }')"
+    ANAMNESIS_SPENT="$(LC_ALL=C awk -v a="$ANAMNESIS_SPENT" -v b="$1" 'BEGIN { printf "%.2f", a + b }')"
 }
 
 # Prints --max-time for the next curl: the per-request cap, or what is left
@@ -257,8 +304,8 @@ anamnesis_budget_left() {
     case "${ANAMNESIS_DEADLINE:-}" in
         ''|*[!0-9.]*) printf '%s' "$ANAMNESIS_CURL_TIMEOUT"; return 0 ;;
     esac
-    awk -v d="$ANAMNESIS_DEADLINE" -v s="$ANAMNESIS_SPENT" -v c="$ANAMNESIS_CURL_TIMEOUT" \
-        'BEGIN { r = d - s; if (r > c) r = c; if (r < 0.5) print 0; else printf "%.1f", r }'
+    LC_ALL=C awk -v d="$ANAMNESIS_DEADLINE" -v s="$ANAMNESIS_SPENT" -v c="$ANAMNESIS_CURL_TIMEOUT" \
+        'BEGIN { r = int((d - s) * 10) / 10; if (r > c) r = c; if (r < 0.5) print 0; else printf "%.1f", r }'
 }
 
 # Usage: anamnesis_curl <max-time> <curl args...>
@@ -270,7 +317,7 @@ anamnesis_curl() {
     local max="$1" report took
     shift
     ANAMNESIS_ATTEMPTS=$((ANAMNESIS_ATTEMPTS + 1))
-    report="$(curl -sS --connect-timeout "$ANAMNESIS_CONNECT_TIMEOUT" --max-time "$max" \
+    report="$(LC_ALL=C curl -sS --connect-timeout "$ANAMNESIS_CONNECT_TIMEOUT" --max-time "$max" \
         -w '%{http_code} %{time_total}' "$@" 2>/dev/null)"
     ANAMNESIS_CURL_EXIT=$?
     ANAMNESIS_STATUS="${report%% *}"
@@ -314,22 +361,22 @@ anamnesis_attempt_retryable() {
 }
 
 # Prints the seconds a Retry-After header asks for, 0 when there is none.
-# Returns 1 for a header it cannot read (the HTTP-date form, or junk): an
-# unknown wait is not a wait of zero.
+# Returns 1 for a header it cannot read (the HTTP-date form, junk, or ten
+# digits and more): an unknown wait is not a wait of zero.
 anamnesis_retry_after() {
     local wait
     wait="$(sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*//p' "$1" 2>/dev/null | head -1 | tr -d '\r[:space:]')"
     case "$wait" in
         '') printf 0 ;;
-        *[!0-9]*) return 1 ;;
+        *[!0-9]*|??????????*) return 1 ;;
         *) printf '%s' "$wait" ;;
     esac
 }
 
 # Usage: anamnesis_retry_due <headers-file>
 # After an attempt: whether to make one more, after ANAMNESIS_RETRY_WAIT
-# seconds. Only under a deadline, only after the first attempt, only for a
-# failure a retry can mend, and only when the Retry-After the server asked
+# seconds. Only when the hook asked for it (ANAMNESIS_RETRY=1) under a
+# deadline, only after the first attempt, only for a failure a retry can mend, and only when the Retry-After the server asked
 # for (kept for the log either way) can be read and leaves two seconds of
 # budget once waited out.
 anamnesis_retry_due() {
@@ -340,8 +387,8 @@ anamnesis_retry_due() {
         return 1
     fi
     [ "$wait" -gt 0 ] && ANAMNESIS_FAIL_NOTE="Retry-After $wait s"
-    [ -n "${ANAMNESIS_DEADLINE:-}" ] && [ "$ANAMNESIS_ATTEMPTS" -eq 1 ] && anamnesis_attempt_retryable || return 1
-    awk -v d="$ANAMNESIS_DEADLINE" -v s="$ANAMNESIS_SPENT" -v w="$wait" 'BEGIN { exit !(d - s - w >= 2) }' || return 1
+    [ "$ANAMNESIS_RETRY" = 1 ] && [ -n "$ANAMNESIS_DEADLINE" ] && [ "$ANAMNESIS_ATTEMPTS" -eq 1 ] && anamnesis_attempt_retryable || return 1
+    LC_ALL=C awk -v d="$ANAMNESIS_DEADLINE" -v s="$ANAMNESIS_SPENT" -v w="$wait" 'BEGIN { exit !(d - s - w >= 2) }' || return 1
     ANAMNESIS_RETRY_WAIT="$wait"
 }
 
@@ -371,7 +418,7 @@ anamnesis_failure_detail() {
 # two seconds are left after any Retry-After. Credentials and the body go
 # to curl through 0600 files, never as arguments.
 anamnesis_request() {
-    local method="$1" path="$2" body="${3:-}" dir max
+    local method="$1" path="$2" body="${3:-}" dir rc
     ANAMNESIS_RESPONSE=""
     ANAMNESIS_SERVER_TIME=""
     ANAMNESIS_STATUS=""
@@ -389,6 +436,9 @@ anamnesis_request() {
     # caller queues or skips instead.
     if [ "${ANAMNESIS_AUTH_MODE:-}" = "oauth" ] && ! anamnesis_ensure_token; then
         ANAMNESIS_FAIL_STAGE="token_refresh"
+        # A refresh that could not even start (no PID, no lock dir) is a
+        # local failure, not a connection that failed.
+        : "${ANAMNESIS_FAIL_CLASS:=local}"
         return 1
     fi
     ANAMNESIS_FAIL_STAGE="request"
@@ -397,6 +447,19 @@ anamnesis_request() {
         anamnesis_log_error "request_skipped" "mktemp failed for $path"
         return 1
     fi
+    anamnesis_tmp_guard "$dir"
+    anamnesis_request_in "$dir" "$method" "$path" "$body"
+    rc=$?
+    rm -rf "$dir"
+    anamnesis_tmp_unguard
+    printf '%s' "$ANAMNESIS_RESPONSE"
+    return $rc
+}
+
+# The attempts and the verdict of anamnesis_request, with the directory's
+# removal left to the caller so one path covers every return.
+anamnesis_request_in() {
+    local dir="$1" method="$2" path="$3" body="$4" max
     if [ "${ANAMNESIS_AUTH_MODE:-}" = "oauth" ]; then
         printf 'Authorization: Bearer %s\n' "$ANAMNESIS_ACCESS_TOKEN" > "$dir/auth"
     else
@@ -411,10 +474,9 @@ anamnesis_request() {
     while :; do
         max="$(anamnesis_budget_left)"
         if [ "$max" = 0 ]; then
-            # The refresh took the whole budget; nothing was sent.
             ANAMNESIS_STATUS="000"
             ANAMNESIS_FAIL_CLASS="timeout"
-            rm -rf "$dir"
+            ANAMNESIS_FAIL_NOTE="the refresh used the whole budget, nothing was sent"
             return 1
         fi
         rm -f "$dir/headers" "$dir/body"
@@ -432,8 +494,6 @@ anamnesis_request() {
     done
     [ -r "$dir/body" ] && ANAMNESIS_RESPONSE="$(cat "$dir/body")"
     [ -r "$dir/headers" ] && ANAMNESIS_SERVER_TIME="$(sed -n 's/^[Dd]ate:[[:space:]]*//p' "$dir/headers" | head -1 | tr -d '\r')"
-    rm -rf "$dir"
-    printf '%s' "$ANAMNESIS_RESPONSE"
     if [ "$ANAMNESIS_CURL_EXIT" -ne 0 ]; then
         anamnesis_classify_failure
         return 1
@@ -444,7 +504,8 @@ anamnesis_request() {
             if printf '%s' "$ANAMNESIS_RESPONSE" | jq -e 'type == "object" and .status == "error"' >/dev/null 2>&1; then
                 ANAMNESIS_FAIL_CLASS="server"
                 ANAMNESIS_FAIL_NOTE="the server reported an error"
-                anamnesis_log_error "server_reported_error" "HTTP $ANAMNESIS_STATUS on $path: $(printf '%s' "$ANAMNESIS_RESPONSE" | jq -r '(.message // .error // "") | tostring | .[0:200]' 2>/dev/null)"
+                # The message is server text and could echo a query; only its length is logged.
+                anamnesis_log_error "server_reported_error" "HTTP $ANAMNESIS_STATUS on $path: status=error, message of $(printf '%s' "$ANAMNESIS_RESPONSE" | jq -r '(.message // .error // "") | tostring | length' 2>/dev/null) characters"
                 return 3
             fi
             ANAMNESIS_FAIL_STAGE=""
@@ -793,13 +854,18 @@ anamnesis_prompt_hook() {
     fi
     if [ "$status" -eq 0 ]; then
         # Server headlines first (one line per hit, substance first); older
-        # servers only send hit bodies.
-        lines="$(printf '%s' "$ANAMNESIS_RESPONSE" | jq -c "$ANAMNESIS_JQ_DEFANG"'
+        # servers only send hit bodies. An answer jq cannot read this way
+        # is as much a parse failure as one without the shape.
+        if ! lines="$(printf '%s' "$ANAMNESIS_RESPONSE" | jq -c "$ANAMNESIS_JQ_DEFANG"'
             (if ((.headlines // []) | length) > 0 then [.headlines[] | tostring]
              else [((.engrams // []) + (.results // []))[] | (.body // .content // .text // empty) | tostring]
              end)
-            | map(gsub("\n"; " ") | .[0:220] | defang) | .[0:5]' 2>/dev/null)" || lines="[]"
-        [ -n "$lines" ] || lines="[]"
+            | map(gsub("\n"; " ") | .[0:220] | defang) | .[0:5]' 2>/dev/null)" || [ -z "$lines" ]; then
+            lines="[]"
+            status=1
+            ANAMNESIS_FAIL_STAGE="response_parse"
+            ANAMNESIS_FAIL_CLASS="parse"
+        fi
     fi
     count="$(printf '%s' "$lines" | jq 'length' 2>/dev/null)"
     case "$count" in ''|*[!0-9]*) count=0 ;; esac
@@ -858,7 +924,7 @@ anamnesis_recall_receipt() {
 # not silence it, since a recall that fails quietly is the one thing the
 # user cannot tell from one that works.
 anamnesis_recall_notice() {
-    local class="${ANAMNESIS_FAIL_CLASS:-connect}" why due=1
+    local class="${ANAMNESIS_FAIL_CLASS:-local}" why due=1
     if ! anamnesis_receipt_fired "fail.$class" || anamnesis_receipt_fired "recall_ok"; then
         due=0
     fi
@@ -1053,6 +1119,18 @@ anamnesis_receipt_mark() {
 
 anamnesis_receipt_fired() {
     [ -e "$(anamnesis_receipt_marker "$1")" ]
+}
+
+# Session start forgets what recall told the user before: a session resumed
+# under its old id, or a host that sends no id and so shares one marker key,
+# must hear of an outage that outlived the last run.
+anamnesis_recall_markers_reset() {
+    local m
+    for m in "$ANAMNESIS_RECEIPT_DIR/$(anamnesis_transcript_key "${ANAMNESIS_SID:-nosid}")".fail.* \
+             "$(anamnesis_receipt_marker recall_ok)"; do
+        [ -e "$m" ] && rm -f "$m"
+    done
+    return 0
 }
 
 # Session ids never repeat, so old markers are litter.
